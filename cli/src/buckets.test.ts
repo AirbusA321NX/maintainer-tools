@@ -25,7 +25,7 @@ const context: ClassifyContext = {
 };
 
 function pullRequest(overrides: Partial<PullRequest> = {}): PullRequest {
-  return {
+  const result: PullRequest = {
     repo: { owner: 'example', name: 'repo' },
     number: 1,
     title: 'Test priority-author classification',
@@ -57,6 +57,14 @@ function pullRequest(overrides: Partial<PullRequest> = {}): PullRequest {
     comments: [],
     body: 'This pull request has a complete description.\n\nCloses #1',
     ...overrides,
+  };
+  return {
+    ...result,
+    commits: result.commits.map((commit) =>
+      commit.authorLogin === undefined
+        ? { ...commit, authorLogin: result.author?.login ?? null }
+        : commit,
+    ),
   };
 }
 
@@ -377,6 +385,7 @@ test('author replies are case-insensitive for bottleneck detection', () => {
         messageHeadline: 'Test priority-author classification',
         messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
         authorEmail: 'contributor@example.com',
+        authorLogin: 'contributor',
         committedDate: hoursAgo(4),
         parents: 1,
       },
@@ -458,6 +467,7 @@ test('a later COMMENTED review does not clear an active changes request', () => 
         messageHeadline: 'Existing revision',
         messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
         authorEmail: 'contributor@example.com',
+        authorLogin: 'contributor',
         committedDate: hoursAgo(6),
         parents: 1,
       },

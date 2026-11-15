@@ -209,8 +209,9 @@ export function getLastReviewOrMaintainerActivityState(
             hasInvalidActivityTimestamp = true;
             continue;
           }
-          if (maintainerConfig?.status === 'unavailable' && !isReviewer && privilegedAssociation) {
+          if (maintainerConfig?.status === 'unavailable' && privilegedAssociation) {
             hasMaintainerConfigUncertainty = true;
+            continue;
           }
           if (isLater(comment.createdAt, latest)) latest = comment.createdAt;
         }

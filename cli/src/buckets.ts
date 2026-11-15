@@ -341,10 +341,16 @@ function authorActedSinceViewerReview(
   // Did the author push commits after the viewer's review?
   const authorLogin = pr.author?.login;
   if (!authorLogin) return false;
-  const headCommittedAt = Date.parse(
-    pr.commits[pr.commits.length - 1]?.committedDate ?? pr.updatedAt,
-  );
-  if (headCommittedAt > latestActivity) return true;
+  const headCommit = pr.commits[pr.commits.length - 1];
+  const headCommittedAt = Date.parse(headCommit?.committedDate ?? '');
+  if (
+    headCommit &&
+    headCommit.authorLogin &&
+    sameLogin(headCommit.authorLogin, authorLogin) &&
+    headCommittedAt > latestActivity
+  ) {
+    return true;
+  }
   // Or commented since?
   for (const c of pr.comments) {
     if (
@@ -383,18 +389,19 @@ export function matchesGlob(path: string, pattern: string): boolean {
   const doubleStarDirectory = core.startsWith('**/');
   const source = directoryPattern ? `${core}/**` : doubleStarDirectory ? core.slice(3) : core;
   const prefix = doubleStarDirectory ? '^(?:.*/)?' : rooted || hasSlash ? '^' : '^(?:.*/)?';
-  const re = new RegExp(
-    prefix +
-      source
-        .split(/(\*\*|\*)/)
-        .map((token) => {
-          if (token === '**') return '.*';
-          if (token === '*') return '[^/]*';
-          return escapeRegex(token);
-        })
-        .join('') +
-      '$',
-  );
+  const tokens = source.split(/(\*\*|\*)/);
+  const patternRegex = tokens
+    .map((token, index) => {
+      if (token === '**' && tokens[index + 1]?.startsWith('/')) return '(?:.*/)?';
+      if (index > 0 && tokens[index - 1] === '**' && token.startsWith('/')) {
+        return escapeRegex(token.slice(1));
+      }
+      if (token === '**') return '.*';
+      if (token === '*') return '[^/]*';
+      return escapeRegex(token);
+    })
+    .join('');
+  const re = new RegExp(prefix + patternRegex + '$');
   return re.test(path);
 }
 
@@ -412,10 +419,19 @@ function computeFlags(pr: PullRequest, checks: CheckResult[], ctx: ClassifyConte
   flags.push(...issueFlags(pr, ctx));
   if (pr.isDraft) flags.push('DRAFT');
   if (isBotAuthor(pr) || isDependencyBot(pr)) flags.push('BOT');
-  if (pr.labels.some((l) => l === 'release-blocker' || l === 'blocker')) flags.push('BLOCKER');
+  if (
+    pr.labels.some((label) => {
+      const normalized = label.trim().toLowerCase();
+      return normalized === 'release-blocker' || normalized === 'blocker';
+    })
+  ) {
+    flags.push('BLOCKER');
+  }
   if (checks.some((c) => c.id === 'merge_conflict' && c.triggered)) flags.push('MERGE-CONFLICT');
   if (checks.some((c) => c.id === 'stale_on_author' && c.triggered)) flags.push('STALE');
-  if (pr.labels.includes('awaiting-maintainer-input')) flags.push('QUESTION');
+  if (pr.labels.some((label) => label.trim().toLowerCase() === 'awaiting-maintainer-input')) {
+    flags.push('QUESTION');
+  }
   if (pr.labels.some((label) => label.trim().toLowerCase() === 'waiting-for-author')) {
     flags.push('WAITING-FOR-AUTHOR');
   }

@@ -78,6 +78,13 @@
     "changedFiles": 2,
     "files": ["cmd/query/app/handler.go"],
     "statusCheckRollup": "FAILURE",
+    "headCheckRuns": [
+      {
+        "name": "build",
+        "conclusion": "failure"
+      }
+    ],
+    "headCheckRunsTruncated": false,
     "commits": [
       {
         "sha": "ci0001",
@@ -345,6 +352,13 @@
     "changedFiles": 1,
     "files": ["model/timestamp.go"],
     "statusCheckRollup": "FAILURE",
+    "headCheckRuns": [
+      {
+        "name": "build",
+        "conclusion": "failure"
+      }
+    ],
+    "headCheckRunsTruncated": false,
     "commits": [
       {
         "sha": "age0001",

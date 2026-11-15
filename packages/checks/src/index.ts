@@ -39,4 +39,30 @@ export {
   staleOnAuthor,
 } from './predicates/index.js';
 export { createGraphqlClient } from './graphql.js';
-export type { GraphqlClient, PrSummary } from './graphql.js';
+export type {
+  GraphqlClient,
+  PrSummary,
+  CommitPathComparison,
+  ExternalCommitParents,
+} from './graphql.js';
+export {
+  verifyCommitAncestor,
+  hasQualifyingAuthorAuthoredCommit,
+  isTreeEntryModified,
+  type AncestryResult,
+  type ExternalCommitNode,
+  type QualifyingCommitResult,
+  type TraversalLimits,
+  type VerifyAncestorOptions,
+} from './graph.js';
+export {
+  classifyActor,
+  evaluateChangesRequestedForReviewer,
+  getLastReviewOrMaintainerActivity,
+  getLastReviewOrMaintainerActivityState,
+  getLatestReviewsByReviewer,
+  collectCompletenessWarnings,
+  type ClassifyActorOptions,
+  type MaintainerConfig,
+  type ReviewerReviewResult,
+} from './actor.js';

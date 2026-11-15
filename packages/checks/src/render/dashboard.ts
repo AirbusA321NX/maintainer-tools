@@ -9,12 +9,14 @@ import type {
   DashboardSectionKey,
   PullRequest,
 } from '../types.js';
-import { classifyActor, parseDateSafe } from '../actor.js';
+import { classifyActor, parseDateSafe, type ClassifyActorOptions } from '../actor.js';
 
 const INACTIVE_AUTHOR_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 export function escapeMarkdown(str: string): string {
   return str
+    .replace(/&/g, '&amp;')
+    .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
     .replace(/\r?\n/g, ' ')
     .replace(/</g, '&lt;')
@@ -42,6 +44,14 @@ function renderLogin(login: string | null | undefined): string {
   return `[${label}](https://github.com/${target})`;
 }
 
+function renderAuthor(pr: PullRequest, classification: ActorClassification): string {
+  const loginLink = renderLogin(pr.author?.login);
+  if (classification.isBotAuthored && !classification.isDependencyBot) {
+    return `${loginLink} \`[bot]\``;
+  }
+  return loginLink;
+}
+
 function renderReviewRequest(
   req: PullRequest['reviewRequests'][number],
   repoOwner: string,
@@ -51,6 +61,13 @@ function renderReviewRequest(
   if (req.kind === 'team') {
     const owner = encodeURIComponent(repoOwner);
     return `[${label}](https://github.com/orgs/${owner}/teams/${target})`;
+  }
+  if (req.kind === 'enterprise_team') {
+    if (req.enterpriseSlug) {
+      const enterprise = encodeURIComponent(req.enterpriseSlug);
+      return `[${label}](https://github.com/enterprises/${enterprise}/teams/${target})`;
+    }
+    return label;
   }
   return `[${label}](https://github.com/${target})`;
 }
@@ -68,6 +85,7 @@ export function groupDashboardItems(
   prs: PullRequest[],
   repo: { owner: string; name: string },
   now: Date = new Date(),
+  options?: { maxRowsPerSection?: number; classifier?: ClassifyActorOptions },
 ): DashboardData {
   const sectionsMap = new Map<DashboardSectionKey, DashboardItem[]>([
     ['ready_to_merge', []],
@@ -78,12 +96,13 @@ export function groupDashboardItems(
   ]);
 
   for (const pr of prs) {
-    const classification = classifyActor(pr);
+    const classification = classifyActor(pr, options?.classifier);
     const turnStartedMs = parseDateSafe(classification.turnStartedAt);
     const waitingDurationMs = turnStartedMs <= 0 ? 0 : Math.max(0, now.getTime() - turnStartedMs);
     const isInactiveAuthor =
       classification.nextActor === 'author' &&
       !classification.isDraft &&
+      !classification.warnings?.includes('activity_data_incomplete') &&
       waitingDurationMs > INACTIVE_AUTHOR_MS;
 
     const item: DashboardItem = {
@@ -111,46 +130,32 @@ export function groupDashboardItems(
     items.sort((a, b) => b.waitingDurationMs - a.waitingDurationMs || a.pr.number - b.pr.number);
   }
 
-  const waitingOnAuthors = sectionsMap.get('waiting_on_authors')!;
-  const inactiveAuthorCount = waitingOnAuthors.filter((i) => i.isInactiveAuthor).length;
+  const maxRows = options?.maxRowsPerSection;
+  const buildSection = (key: DashboardSectionKey, title: string): DashboardSection => {
+    const allItems = sectionsMap.get(key)!;
+    const totalCount = allItems.length;
+    const items =
+      maxRows !== undefined && maxRows < totalCount ? allItems.slice(0, maxRows) : allItems;
+    const omittedCount = totalCount - items.length;
+    const section: DashboardSection = {
+      key,
+      title,
+      items,
+      totalCount,
+      omittedCount,
+    };
+    if (key === 'waiting_on_authors') {
+      section.inactiveAuthorCount = allItems.filter((i) => i.isInactiveAuthor).length;
+    }
+    return section;
+  };
 
   const sections: DashboardSection[] = [
-    {
-      key: 'ready_to_merge',
-      title: 'Ready to merge',
-      items: sectionsMap.get('ready_to_merge')!,
-      totalCount: sectionsMap.get('ready_to_merge')!.length,
-      omittedCount: 0,
-    },
-    {
-      key: 'waiting_on_reviewers',
-      title: 'Waiting on reviewers',
-      items: sectionsMap.get('waiting_on_reviewers')!,
-      totalCount: sectionsMap.get('waiting_on_reviewers')!.length,
-      omittedCount: 0,
-    },
-    {
-      key: 'waiting_on_authors',
-      title: 'Waiting on authors',
-      items: waitingOnAuthors,
-      totalCount: waitingOnAuthors.length,
-      omittedCount: 0,
-      inactiveAuthorCount,
-    },
-    {
-      key: 'draft_prs',
-      title: 'Draft pull requests',
-      items: sectionsMap.get('draft_prs')!,
-      totalCount: sectionsMap.get('draft_prs')!.length,
-      omittedCount: 0,
-    },
-    {
-      key: 'dependency_updates',
-      title: 'Dependency updates',
-      items: sectionsMap.get('dependency_updates')!,
-      totalCount: sectionsMap.get('dependency_updates')!.length,
-      omittedCount: 0,
-    },
+    buildSection('ready_to_merge', 'Ready to merge'),
+    buildSection('waiting_on_reviewers', 'Waiting on reviewers'),
+    buildSection('waiting_on_authors', 'Waiting on authors'),
+    buildSection('draft_prs', 'Draft pull requests'),
+    buildSection('dependency_updates', 'Dependency updates'),
   ];
 
   return {
@@ -186,11 +191,12 @@ function renderTable(
   }
 
   if (countOnly) {
-    return { content: `_${section.totalCount} pull requests._\n`, omitted: section.totalCount };
+    const noun = section.totalCount === 1 ? 'pull request' : 'pull requests';
+    return { content: `_${section.totalCount} ${noun}._\n`, omitted: section.totalCount };
   }
 
   const itemsToRender = section.items.slice(0, maxRows);
-  const omitted = section.items.length - itemsToRender.length;
+  const omitted = section.totalCount - itemsToRender.length;
   const rows: string[] = [];
 
   switch (section.key) {
@@ -199,7 +205,7 @@ function renderTable(
       rows.push('| :--- | :--- | :--- | :--- |');
       for (const item of itemsToRender) {
         rows.push(
-          `| ${renderPrLink(item.pr)} | ${renderLogin(item.pr.author?.login)} | ${formatAge(item.waitingDurationMs)} | \`${item.classification.reason}\`${renderWarnings(item.classification)} |`,
+          `| ${renderPrLink(item.pr)} | ${renderAuthor(item.pr, item.classification)} | ${formatAge(item.waitingDurationMs)} | \`${item.classification.reason}\`${renderWarnings(item.classification)} |`,
         );
       }
       break;
@@ -213,7 +219,7 @@ function renderTable(
             ? item.pr.reviewRequests.map((r) => renderReviewRequest(r, repoOwner)).join(', ')
             : '_None requested_';
         rows.push(
-          `| ${renderPrLink(item.pr)} | ${renderLogin(item.pr.author?.login)} | ${reviewers} | ${formatAge(item.waitingDurationMs)} | \`${item.classification.reason}\`${renderWarnings(item.classification)} |`,
+          `| ${renderPrLink(item.pr)} | ${renderAuthor(item.pr, item.classification)} | ${reviewers} | ${formatAge(item.waitingDurationMs)} | \`${item.classification.reason}\`${renderWarnings(item.classification)} |`,
         );
       }
       break;
@@ -226,7 +232,7 @@ function renderTable(
           ? `${formatAge(item.waitingDurationMs)} \`7d+\``
           : formatAge(item.waitingDurationMs);
         rows.push(
-          `| ${renderPrLink(item.pr)} | ${renderLogin(item.pr.author?.login)} | \`${item.classification.reason}\`${renderWarnings(item.classification)} | ${ageBadge} |`,
+          `| ${renderPrLink(item.pr)} | ${renderAuthor(item.pr, item.classification)} | \`${item.classification.reason}\`${renderWarnings(item.classification)} | ${ageBadge} |`,
         );
       }
       break;
@@ -236,7 +242,7 @@ function renderTable(
       rows.push('| :--- | :--- | :--- |');
       for (const item of itemsToRender) {
         rows.push(
-          `| ${renderPrLink(item.pr)} | ${renderLogin(item.pr.author?.login)} | ${formatAge(item.waitingDurationMs)}${renderWarnings(item.classification)} |`,
+          `| ${renderPrLink(item.pr)} | ${renderAuthor(item.pr, item.classification)} | ${formatAge(item.waitingDurationMs)}${renderWarnings(item.classification)} |`,
         );
       }
       break;
@@ -247,7 +253,7 @@ function renderTable(
       for (const item of itemsToRender) {
         const status = item.pr.isDraft ? '`draft`' : '`ready`';
         rows.push(
-          `| ${renderPrLink(item.pr)} | ${renderLogin(item.pr.author?.login)} | ${status} | ${formatAge(item.waitingDurationMs)}${renderWarnings(item.classification)} |`,
+          `| ${renderPrLink(item.pr)} | ${renderAuthor(item.pr, item.classification)} | ${status} | ${formatAge(item.waitingDurationMs)}${renderWarnings(item.classification)} |`,
         );
       }
       break;
@@ -267,7 +273,9 @@ function assembleBody(data: DashboardData, options: RenderOptions): string {
   const countOnly = options.countOnlyCollapsed ?? false;
   const parts: string[] = [];
 
-  parts.push(`# Pull Request Triage Dashboard for ${data.repo.owner}/${data.repo.name}\n`);
+  parts.push(
+    `# Pull Request Triage Dashboard for ${escapeMarkdown(data.repo.owner)}/${escapeMarkdown(data.repo.name)}\n`,
+  );
 
   for (const section of data.sections) {
     const isCollapsed = section.key === 'draft_prs' || section.key === 'dependency_updates';

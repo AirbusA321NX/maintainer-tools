@@ -32,13 +32,98 @@ function hoursAgo(hours: number): string {
   return new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
 }
 
-function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
+type PullRequestOverrides = Omit<
+  Partial<PullRequest>,
+  'commits' | 'reviews' | 'comments' | 'reviewThreads'
+> & {
+  commits?: Array<Partial<PullRequest['commits'][number]>>;
+  reviews?: Array<Partial<PullRequest['reviews'][number]>>;
+  comments?: Array<Partial<PullRequest['comments'][number]>>;
+  reviewThreads?: Array<
+    Partial<Omit<NonNullable<PullRequest['reviewThreads']>[number], 'comments'>> & {
+      comments?: Array<
+        Partial<NonNullable<PullRequest['reviewThreads']>[number]['comments'][number]>
+      >;
+    }
+  >;
+};
+
+function makePr(overrides: PullRequestOverrides = {}): PullRequest {
   const number = overrides.number ?? 1;
+
+  const defaultCommit: PullRequest['commits'][number] = {
+    sha: 'abc1234',
+    messageHeadline: 'feat: sample',
+    messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+    authorEmail: 'contributor@example.com',
+    authorLogin: 'contributor',
+    authorTypename: 'User',
+    committedDate: daysAgo(5),
+    parents: 1,
+    parentOids: ['sha-parent'],
+    parentsTruncated: false,
+    changedFilesIfAvailable: 1,
+  };
+
+  const commits: PullRequest['commits'] = (overrides.commits ?? [defaultCommit]).map((c) => ({
+    sha: c.sha ?? 'abc1234',
+    messageHeadline: c.messageHeadline ?? 'feat: sample',
+    messageBody: c.messageBody ?? 'Signed-off-by: Contributor <contributor@example.com>',
+    authorEmail: c.authorEmail !== undefined ? c.authorEmail : 'contributor@example.com',
+    authorLogin: c.authorLogin !== undefined ? c.authorLogin : 'contributor',
+    authorTypename: c.authorTypename !== undefined ? c.authorTypename : 'User',
+    committedDate: c.committedDate ?? daysAgo(5),
+    parents: c.parents ?? 1,
+    parentOids: c.parentOids ?? ['sha-parent'],
+    parentsTruncated: c.parentsTruncated ?? false,
+    changedFilesIfAvailable:
+      c.changedFilesIfAvailable !== undefined ? c.changedFilesIfAvailable : 1,
+  }));
+
+  const reviews: PullRequest['reviews'] = (overrides.reviews ?? []).map((r) => ({
+    id: r.id ?? 'PRR_test',
+    author: r.author !== undefined ? r.author : 'reviewer',
+    authorTypename: r.authorTypename !== undefined ? r.authorTypename : 'User',
+    state: r.state ?? 'APPROVED',
+    submittedAt: r.submittedAt ?? hoursAgo(1),
+    commitOid: r.commitOid !== undefined ? r.commitOid : null,
+    ...(r.url !== undefined ? { url: r.url } : {}),
+    ...(r.body !== undefined ? { body: r.body } : {}),
+  }));
+
+  const comments: PullRequest['comments'] = (overrides.comments ?? []).map((c) => ({
+    author: c.author !== undefined ? c.author : 'contributor',
+    authorTypename: c.authorTypename !== undefined ? c.authorTypename : 'User',
+    authorAssociation: c.authorAssociation !== undefined ? c.authorAssociation : 'CONTRIBUTOR',
+    createdAt: c.createdAt ?? hoursAgo(1),
+  }));
+
+  const reviewThreads: PullRequest['reviewThreads'] = overrides.reviewThreads
+    ? overrides.reviewThreads.map((t) => ({
+        path: t.path,
+        isResolved: t.isResolved ?? false,
+        resolvedBy: t.resolvedBy !== undefined ? t.resolvedBy : null,
+        commentsTruncated: t.commentsTruncated !== undefined ? t.commentsTruncated : false,
+        comments: (t.comments ?? []).map((c) => ({
+          author: c.author !== undefined ? c.author : null,
+          authorTypename: c.authorTypename !== undefined ? c.authorTypename : 'User',
+          authorAssociation:
+            c.authorAssociation !== undefined ? c.authorAssociation : 'CONTRIBUTOR',
+          createdAt: c.createdAt ?? hoursAgo(1),
+          commitOid: c.commitOid !== undefined ? c.commitOid : null,
+          originalCommitOid: c.originalCommitOid !== undefined ? c.originalCommitOid : null,
+          pullRequestReview: c.pullRequestReview !== undefined ? c.pullRequestReview : null,
+        })),
+      }))
+    : [];
+
   return {
     repo: { owner: 'jaegertracing', name: 'jaeger' },
     number,
     title: 'Sample pull request',
     url: overrides.url ?? `https://github.com/jaegertracing/jaeger/pull/${number}`,
+    headRefOid: overrides.headRefOid ?? 'sha-head',
+    baseRefOid: overrides.baseRefOid ?? 'sha-base',
     author: { login: 'contributor', typename: 'User' },
     authorAssociation: 'CONTRIBUTOR',
     isDraft: false,
@@ -51,20 +136,17 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
     changedFiles: 1,
     files: ['pkg/test.go'],
     statusCheckRollup: 'SUCCESS',
-    commits: [
-      {
-        sha: 'abc1234',
-        messageHeadline: 'feat: sample',
-        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
-        authorEmail: 'contributor@example.com',
-        committedDate: daysAgo(5),
-        parents: 1,
-      },
-    ],
+    commitsTruncated: false,
     reviewRequests: [],
-    reviews: [],
-    comments: [],
+    reviewRequestsTruncated: false,
+    reviewsTruncated: false,
+    reviewThreadsTruncated: false,
+    headCheckRunsTruncated: false,
     ...overrides,
+    commits,
+    reviews,
+    comments,
+    reviewThreads,
   };
 }
 
@@ -170,6 +252,8 @@ test('renderDashboard formats 7d+ inactive author aging indicator and header cou
     title: 'Active blocker under 7 days',
     author: { login: 'author-active', typename: 'User' },
     statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'build', conclusion: 'failure' }],
+    headCheckRunsTruncated: false,
     commits: [
       {
         sha: 'active1',
@@ -186,7 +270,10 @@ test('renderDashboard formats 7d+ inactive author aging indicator and header cou
     number: 11,
     title: 'Inactive blocker older than 7 days',
     author: { login: 'author-inactive', typename: 'User' },
+    createdAt: daysAgo(10),
     statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'build', conclusion: 'failure' }],
+    headCheckRunsTruncated: false,
     commits: [
       {
         sha: 'inactive1',
@@ -416,7 +503,10 @@ test('Exact 7-day boundary for inactive author flag', () => {
   // PR 1: exactly 7 days old turn (not strictly > 7 days, so not inactive)
   const prExact7d = makePr({
     number: 201,
+    createdAt: daysAgo(10),
     statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'build', conclusion: 'failure' }],
+    headCheckRunsTruncated: false,
     commits: [
       {
         sha: 'exact7d',
@@ -431,7 +521,10 @@ test('Exact 7-day boundary for inactive author flag', () => {
   // PR 2: 7 days plus 1 second (strictly > 7 days, so inactive)
   const prOver7d = makePr({
     number: 202,
+    createdAt: daysAgo(10),
     statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'build', conclusion: 'failure' }],
+    headCheckRunsTruncated: false,
     commits: [
       {
         sha: 'over7d',
@@ -553,11 +646,52 @@ test('renderDashboard with countOnlyAll: true renders all sections as count-only
   const data = groupDashboardItems(prs, defaultRepo, now);
   const markdown = renderDashboard(data, { countOnlyAll: true });
 
-  // Each non-empty section must render a count string
-  assert.ok(markdown.includes('_1 pull requests._'));
+  // Each non-empty section must render a singular count string for count === 1
+  assert.ok(markdown.includes('_1 pull request._'));
   // Zero table headers or table pipe rows
   assert.ok(!markdown.includes('| :--- |'));
   assert.ok(!markdown.includes('| PR |'));
+});
+
+test('renderDashboard formats [bot] badge for non-dependency bot authors', () => {
+  const releasePleasePr = makePr({
+    number: 601,
+    author: { login: 'release-please', typename: 'Bot' },
+  });
+  const humanPr = makePr({
+    number: 602,
+    author: { login: 'alice', typename: 'User' },
+  });
+
+  const data = groupDashboardItems([releasePleasePr, humanPr], defaultRepo, now);
+  const markdown = renderDashboard(data);
+
+  // Non-dependency bot author must have `[bot]` badge
+  assert.ok(markdown.includes('[release-please](https://github.com/release-please) `[bot]`'));
+  // Human author must NOT have `[bot]` badge
+  assert.ok(markdown.includes('[alice](https://github.com/alice) |'));
+  assert.ok(!markdown.includes('[alice](https://github.com/alice) `[bot]`'));
+});
+
+test('groupDashboardItems populates omittedCount when maxRowsPerSection is specified', () => {
+  const prs = [makePr({ number: 1 }), makePr({ number: 2 }), makePr({ number: 3 })];
+
+  const data = groupDashboardItems(prs, defaultRepo, now, { maxRowsPerSection: 1 });
+  const reviewersSection = data.sections.find((s) => s.key === 'waiting_on_reviewers')!;
+
+  assert.equal(reviewersSection.totalCount, 3);
+  assert.equal(reviewersSection.items.length, 1);
+  assert.equal(reviewersSection.omittedCount, 2);
+});
+
+test('renderDashboard escapes repo name and owner in main heading', () => {
+  const specialRepo = { owner: 'org_test<1>', name: 'repo|special' };
+  const data = groupDashboardItems([], specialRepo, now);
+  const markdown = renderDashboard(data);
+
+  assert.ok(
+    markdown.includes('# Pull Request Triage Dashboard for org_test&lt;1&gt;/repo\\|special'),
+  );
 });
 
 test('renderDashboard encodes URLs safely while escaping display markdown labels', () => {

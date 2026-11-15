@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 import type { PullRequest } from './types.js';
 import { classifyActor, isEarlier, isLater, parseDateSafe } from './actor.js';
-import { isBotAuthor, isBotLogin, isDependencyBotAuthor, KNOWN_BOT_LOGINS } from './logins.js';
-import { unresolvedFromReviewer } from './predicates/unresolved_from_reviewer.js';
+import { getActorIdentityKind, isBotLogin, isDependencyBotAuthor, sameLogin } from './logins.js';
+import { ciFailing } from './predicates/ci_failing.js';
 
 const now = new Date('2026-10-30T12:00:00.000Z');
 
@@ -22,12 +22,166 @@ function daysAgo(days: number): string {
   return new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
 }
 
-function basePr(overrides: Partial<PullRequest> = {}): PullRequest {
+type PullRequestOverrides = Omit<
+  Partial<PullRequest>,
+  'commits' | 'reviews' | 'comments' | 'reviewThreads'
+> & {
+  commits?: Array<Partial<PullRequest['commits'][number]>>;
+  reviews?: Array<Partial<PullRequest['reviews'][number]>>;
+  comments?: Array<Partial<PullRequest['comments'][number]>>;
+  reviewThreads?: Array<
+    Partial<Omit<NonNullable<PullRequest['reviewThreads']>[number], 'comments'>> & {
+      comments?: Array<
+        Partial<NonNullable<PullRequest['reviewThreads']>[number]['comments'][number]>
+      >;
+    }
+  >;
+};
+
+function basePr(overrides: PullRequestOverrides = {}): PullRequest {
+  const defaultCommit: PullRequest['commits'][number] = {
+    sha: 'abc1234',
+    messageHeadline: 'feat: example change',
+    messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+    authorEmail: 'contributor@example.com',
+    authorLogin: 'contributor',
+    authorTypename: 'User',
+    committedDate: daysAgo(5),
+    parents: 1,
+    parentOids: ['sha-parent'],
+    parentsTruncated: false,
+    changedFilesIfAvailable: 1,
+  };
+
+  const commits: PullRequest['commits'] = (overrides.commits ?? [defaultCommit]).map((c) => ({
+    sha: c.sha ?? 'abc1234',
+    messageHeadline: c.messageHeadline ?? 'feat: example change',
+    messageBody: c.messageBody ?? 'Signed-off-by: Contributor <contributor@example.com>',
+    authorEmail: c.authorEmail !== undefined ? c.authorEmail : 'contributor@example.com',
+    authorLogin: c.authorLogin !== undefined ? c.authorLogin : 'contributor',
+    authorTypename: c.authorTypename !== undefined ? c.authorTypename : 'User',
+    committedDate: c.committedDate ?? daysAgo(5),
+    parents: c.parents ?? 1,
+    parentOids: c.parentOids ?? ['sha-parent'],
+    parentsTruncated: c.parentsTruncated ?? false,
+    changedFilesIfAvailable:
+      c.changedFilesIfAvailable !== undefined ? c.changedFilesIfAvailable : 1,
+  }));
+
+  const headRefOid = overrides.headRefOid ?? commits[commits.length - 1]?.sha ?? 'sha-head';
+  const reviews: PullRequest['reviews'] = (overrides.reviews ?? []).map((r) => {
+    const author = r.author !== undefined ? r.author : 'reviewer';
+    const authorTypename =
+      r.authorTypename !== undefined
+        ? r.authorTypename
+        : author === null
+          ? null
+          : isBotLogin(author)
+            ? 'Bot'
+            : 'User';
+    return {
+      id: r.id ?? 'PRR_test',
+      author,
+      authorTypename,
+      state: r.state ?? 'APPROVED',
+      submittedAt: r.submittedAt ?? hoursAgo(1),
+      commitOid:
+        r.commitOid !== undefined
+          ? r.commitOid
+          : (commits
+              .filter(
+                (c) =>
+                  parseDateSafe(c.committedDate) <= parseDateSafe(r.submittedAt ?? hoursAgo(1)),
+              )
+              .at(-1)?.sha ?? null),
+      ...(r.url !== undefined ? { url: r.url } : {}),
+      ...(r.body !== undefined ? { body: r.body } : {}),
+    };
+  });
+
+  const comments: PullRequest['comments'] = (overrides.comments ?? []).map((c) => {
+    const author = c.author !== undefined ? c.author : 'contributor';
+    const authorTypename =
+      c.authorTypename !== undefined
+        ? c.authorTypename
+        : author === null
+          ? null
+          : isBotLogin(author)
+            ? 'Bot'
+            : 'User';
+    return {
+      author,
+      authorTypename,
+      authorAssociation: c.authorAssociation !== undefined ? c.authorAssociation : 'CONTRIBUTOR',
+      createdAt: c.createdAt ?? hoursAgo(1),
+    };
+  });
+
+  const requestedReviewerLogins = new Set(
+    (overrides.reviewRequests ?? [])
+      .filter((request) => request.kind === 'user')
+      .map((request) => request.login.trim().toLowerCase()),
+  );
+
+  const reviewThreads: PullRequest['reviewThreads'] = Object.hasOwn(overrides, 'reviewThreads')
+    ? overrides.reviewThreads === undefined
+      ? undefined
+      : overrides.reviewThreads.map((t) => ({
+          path: t.path,
+          isResolved: t.isResolved ?? false,
+          resolvedBy: t.resolvedBy !== undefined ? t.resolvedBy : null,
+          commentsTruncated: t.commentsTruncated !== undefined ? t.commentsTruncated : false,
+          comments: (t.comments ?? []).map((c) => {
+            const author = c.author !== undefined ? c.author : null;
+            const matchingReview = reviews.find((review) => sameLogin(review.author, author));
+            const isRequestedReviewer =
+              author !== null && requestedReviewerLogins.has(author.trim().toLowerCase());
+            const defaultAnchor = isRequestedReviewer ? headRefOid : null;
+            const authorTypename =
+              c.authorTypename !== undefined
+                ? c.authorTypename
+                : author === null
+                  ? null
+                  : isBotLogin(author)
+                    ? 'Bot'
+                    : 'User';
+            return {
+              author,
+              authorTypename,
+              authorAssociation:
+                c.authorAssociation !== undefined ? c.authorAssociation : 'CONTRIBUTOR',
+              createdAt: c.createdAt ?? hoursAgo(1),
+              commitOid:
+                c.commitOid !== undefined
+                  ? c.commitOid
+                  : (matchingReview?.commitOid ?? defaultAnchor),
+              originalCommitOid:
+                c.originalCommitOid !== undefined
+                  ? c.originalCommitOid
+                  : (matchingReview?.commitOid ?? defaultAnchor),
+              pullRequestReview:
+                c.pullRequestReview !== undefined
+                  ? c.pullRequestReview
+                  : matchingReview
+                    ? {
+                        id: matchingReview.id,
+                        state: matchingReview.state,
+                        submittedAt: matchingReview.submittedAt,
+                        commitOid: matchingReview.commitOid,
+                      }
+                    : null,
+            };
+          }),
+        }))
+    : [];
+
   return {
     repo: { owner: 'jaegertracing', name: 'jaeger' },
     number: 1,
     title: 'Example pull request',
     url: 'https://github.com/jaegertracing/jaeger/pull/1',
+    headRefOid,
+    baseRefOid: overrides.baseRefOid ?? 'sha-base',
     author: { login: 'contributor', typename: 'User' },
     authorAssociation: 'CONTRIBUTOR',
     isDraft: false,
@@ -40,20 +194,25 @@ function basePr(overrides: Partial<PullRequest> = {}): PullRequest {
     changedFiles: 1,
     files: ['pkg/test.go'],
     statusCheckRollup: 'SUCCESS',
-    commits: [
-      {
-        sha: 'abc1234',
-        messageHeadline: 'feat: example change',
-        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
-        authorEmail: 'contributor@example.com',
-        committedDate: daysAgo(5),
-        parents: 1,
-      },
-    ],
+    headCheckRuns: Object.hasOwn(overrides, 'headCheckRuns') ? overrides.headCheckRuns : [],
+    commitsTruncated: false,
+    commentsTruncated: Object.hasOwn(overrides, 'commentsTruncated')
+      ? (overrides.commentsTruncated as boolean)
+      : false,
     reviewRequests: [],
-    reviews: [],
-    comments: [],
+    reviewRequestsTruncated: false,
+    reviewsTruncated: false,
+    reviewThreadsTruncated: Object.hasOwn(overrides, 'reviewThreadsTruncated')
+      ? (overrides.reviewThreadsTruncated as boolean)
+      : false,
+    headCheckRunsTruncated: Object.hasOwn(overrides, 'headCheckRunsTruncated')
+      ? (overrides.headCheckRunsTruncated as boolean)
+      : false,
     ...overrides,
+    commits,
+    reviews,
+    comments,
+    reviewThreads,
   };
 }
 
@@ -68,11 +227,16 @@ test('Rule 1: Dependency bot author routes to nextActor: bot', () => {
   assert.equal(res.turnStartedAt, pr.commits[0]!.committedDate);
 });
 
-test('Rule 1: Renovate unbracketed and bracketed bot detection', () => {
+test('Rule 1: Known dependency bot logins remain recognized across actor typenames', () => {
   assert.equal(isDependencyBotAuthor('renovate'), true);
   assert.equal(isDependencyBotAuthor('renovate[bot]'), true);
   assert.equal(isDependencyBotAuthor('renovate-bot'), true);
   assert.equal(isDependencyBotAuthor('other-bot'), false);
+  assert.equal(isDependencyBotAuthor('dependabot', 'User'), true);
+  assert.equal(isDependencyBotAuthor('renovate', 'EnterpriseUserAccount'), true);
+  assert.equal(isDependencyBotAuthor('dependabot', 'Bot'), true);
+  assert.equal(isDependencyBotAuthor('dependabot', null), true);
+  assert.equal(isDependencyBotAuthor('dependabot', undefined), true);
 });
 
 test('Rule 2: Draft PR routes to nextActor: author', () => {
@@ -88,6 +252,7 @@ test('Rule 2: Draft PR routes to nextActor: author', () => {
 test('Rule 3: CI failure routes to nextActor: author', () => {
   const pr = basePr({
     statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'build', conclusion: 'failure' }],
   });
   const res = classifyActor(pr);
   assert.equal(res.nextActor, 'author');
@@ -121,6 +286,7 @@ test('Rule 3: Merge conflict clock uses later of head commit and reviewer/mainta
     ],
     reviews: [
       {
+        id: 'review-current',
         author: 'reviewer-alice',
         state: 'COMMENTED',
         submittedAt: reviewerActivityDate,
@@ -180,12 +346,22 @@ test('Rule 4: CHANGES_REQUESTED cleared when author pushes newer commit', () => 
     ],
     commits: [
       {
+        sha: 'old',
+        messageHeadline: 'initial commit',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(20),
+        parents: 1,
+        parentOids: ['sha-base'],
+      },
+      {
         sha: 'newer',
         messageHeadline: 'address review comments',
         messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
         authorEmail: 'contributor@example.com',
         committedDate: hoursAgo(2),
         parents: 1,
+        parentOids: ['old'],
       },
     ],
   });
@@ -381,9 +557,9 @@ test('Rule 5: Bot and deleted-account comments in review threads do not trigger 
         isResolved: false,
         resolvedBy: null,
         comments: [
-          { author: 'contributor', createdAt: hoursAgo(10) },
-          { author: 'codecov', createdAt: hoursAgo(5) },
-          { author: null, createdAt: hoursAgo(3) },
+          { author: 'contributor', authorTypename: 'User', createdAt: hoursAgo(10) },
+          { author: 'codecov', authorTypename: 'Bot', createdAt: hoursAgo(5) },
+          { author: null, authorTypename: null, createdAt: hoursAgo(3) },
         ],
       },
     ],
@@ -444,6 +620,25 @@ test('Rule 8: Fully approved PR routes to nextActor: maintainer', () => {
   assert.equal(res.turnStartedAt, approvalTime);
 });
 
+test('Rule 8: Successful rollup remains mergeable when check contexts are truncated', () => {
+  const pr = basePr({
+    statusCheckRollup: 'SUCCESS',
+    headCheckRuns: undefined,
+    headCheckRunsTruncated: true,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
+});
+
 test('Rule 8: One reviewer approves, another has active CHANGES_REQUESTED, author pushes commit -> routes to reviewer', () => {
   // Reviewer A approved, Reviewer B requested changes, author pushed a newer commit addressing it.
   // Because Reviewer B still has CHANGES_REQUESTED as their latest review, GitHub blocks merge.
@@ -451,12 +646,22 @@ test('Rule 8: One reviewer approves, another has active CHANGES_REQUESTED, autho
   const pr = basePr({
     commits: [
       {
+        sha: 'reviewed001',
+        messageHeadline: 'initial commit',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(10),
+        parents: 1,
+        parentOids: ['sha-base'],
+      },
+      {
         sha: 'addr001',
         messageHeadline: 'address comments',
         messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
         authorEmail: 'contributor@example.com',
         committedDate: hoursAgo(1),
         parents: 1,
+        parentOids: ['reviewed001'],
       },
     ],
     reviews: [
@@ -467,6 +672,7 @@ test('Rule 8: One reviewer approves, another has active CHANGES_REQUESTED, autho
       },
       {
         author: 'reviewer-b',
+        commitOid: 'reviewed001',
         state: 'CHANGES_REQUESTED',
         submittedAt: hoursAgo(4),
       },
@@ -529,7 +735,7 @@ test('Rule 8: Approved PR with missing/null CI routes to reviewer, not maintaine
   assert.equal(res.reason, 'awaiting_review');
 });
 
-test('Review state supersession: Approval superseded by newer COMMENTED review', () => {
+test('Review state supersession: Approval NOT superseded by newer COMMENTED review', () => {
   const pr = basePr({
     reviews: [
       {
@@ -546,8 +752,50 @@ test('Review state supersession: Approval superseded by newer COMMENTED review',
   });
 
   const res = classifyActor(pr);
-  assert.equal(res.nextActor, 'reviewer');
-  assert.equal(res.reason, 'awaiting_review');
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
+});
+
+test('Review state supersession: CHANGES_REQUESTED NOT superseded by newer COMMENTED review', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-a',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(8),
+      },
+      {
+        author: 'reviewer-a',
+        state: 'COMMENTED',
+        submittedAt: hoursAgo(2),
+      },
+    ],
+  });
+
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'changes_requested');
+});
+
+test('Review state supersession: Approval NOT superseded by newer PENDING review', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-a',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(8),
+      },
+      {
+        author: 'reviewer-a',
+        state: 'PENDING',
+        submittedAt: hoursAgo(2),
+      },
+    ],
+  });
+
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
 });
 
 test('Review state supersession: Approval superseded by newer DISMISSED review', () => {
@@ -605,7 +853,9 @@ test('Maintainer verification: Aging flag independence from updatedAt', () => {
   const recentUpdated = hoursAgo(0.5);
 
   const pr = basePr({
+    createdAt: daysAgo(12),
     statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'build', conclusion: 'failure' }],
     updatedAt: recentUpdated,
     commits: [
       {
@@ -804,7 +1054,7 @@ test('DCO missing detected across multiple commits with merge commits ignored', 
   assert.equal(res.turnStartedAt, daysAgo(1));
 });
 
-test('Rule 8: Approved PR with newer head commit uses commit timestamp instead of older approval', () => {
+test('Rule 8: Approval predating a newer head commit requires re-review', () => {
   const approvalTime = hoursAgo(6);
   const newerCommitTime = hoursAgo(2);
   const pr = basePr({
@@ -827,9 +1077,8 @@ test('Rule 8: Approved PR with newer head commit uses commit timestamp instead o
     ],
   });
   const res = classifyActor(pr);
-  assert.equal(res.nextActor, 'maintainer');
-  assert.equal(res.reason, 'ready_to_merge');
-  assert.equal(res.turnStartedAt, newerCommitTime);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
 });
 
 test('Timestamp validation: parseDateSafe handles valid, null, undefined, and malformed strings', () => {
@@ -860,7 +1109,7 @@ test('Timestamp validation: isLater and isEarlier handle valid and invalid dates
   assert.equal(isEarlier(malformed, malformed), false);
 });
 
-test('Timestamp validation: latest review selection ignores malformed timestamps', () => {
+test('Timestamp validation: reviewer with valid and malformed reviews fails closed to indeterminate', () => {
   const pr = basePr({
     reviews: [
       {
@@ -876,10 +1125,11 @@ test('Timestamp validation: latest review selection ignores malformed timestamps
     ],
   });
   const res = classifyActor(pr);
-  // Valid review with CHANGES_REQUESTED takes precedence over malformed submittedAt
-  assert.equal(res.nextActor, 'author');
-  assert.equal(res.reason, 'changes_requested');
-  assert.equal(res.turnStartedAt, hoursAgo(10));
+  // An invalid review timestamp prevents treating older review states as authoritative
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
 });
 
 test('Timestamp validation: earliest changes-requested blocker ignores malformed dates', () => {
@@ -904,7 +1154,7 @@ test('Timestamp validation: earliest changes-requested blocker ignores malformed
   assert.equal(res.turnStartedAt, validEarlier);
 });
 
-test('Timestamp validation: latest approval selection ignores malformed timestamps', () => {
+test('Timestamp validation: corrupt approval timestamp fails closed to indeterminate', () => {
   const validApproval = hoursAgo(5);
   const pr = basePr({
     commits: [
@@ -915,6 +1165,7 @@ test('Timestamp validation: latest approval selection ignores malformed timestam
         authorEmail: 'contributor@example.com',
         committedDate: hoursAgo(10),
         parents: 1,
+        parentOids: ['sha-base'],
       },
     ],
     reviews: [
@@ -931,12 +1182,13 @@ test('Timestamp validation: latest approval selection ignores malformed timestam
     ],
   });
   const res = classifyActor(pr);
-  assert.equal(res.nextActor, 'maintainer');
-  assert.equal(res.reason, 'ready_to_merge');
-  assert.equal(res.turnStartedAt, validApproval);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
 });
 
-test('Timestamp validation: thread comment selection ignores malformed timestamps', () => {
+test('Timestamp validation: thread comment selection with partially malformed reviewer timestamps fails closed to indeterminate', () => {
   const validThreadComment = hoursAgo(4);
   const pr = basePr({
     reviews: [{ author: 'reviewer-alice', state: 'COMMENTED', submittedAt: validThreadComment }],
@@ -953,12 +1205,11 @@ test('Timestamp validation: thread comment selection ignores malformed timestamp
     ],
   });
   const res = classifyActor(pr);
-  assert.equal(res.nextActor, 'author');
-  assert.equal(res.reason, 'unresolved_review_thread');
-  assert.equal(res.turnStartedAt, validThreadComment);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
 });
 
-test('Timestamp validation: unresolved thread with only malformed timestamps is ignored', () => {
+test('Timestamp validation: unresolved thread with only malformed timestamps fails closed to indeterminate', () => {
   const pr = basePr({
     reviews: [{ author: 'reviewer-alice', state: 'COMMENTED', submittedAt: hoursAgo(4) }],
     reviewThreads: [
@@ -974,11 +1225,10 @@ test('Timestamp validation: unresolved thread with only malformed timestamps is 
   });
   const res = classifyActor(pr);
   assert.equal(res.nextActor, 'reviewer');
-  assert.equal(res.reason, 'awaiting_review');
-  assert.equal(res.turnStartedAt, pr.commits[pr.commits.length - 1]!.committedDate);
+  assert.equal(res.reason, 'uninspected_review_data');
 });
 
-test('Timestamp validation: review with malformed submittedAt is explicitly rejected', () => {
+test('Timestamp validation: review with malformed submittedAt is explicitly rejected and fails closed to indeterminate', () => {
   const pr = basePr({
     reviews: [
       {
@@ -989,12 +1239,14 @@ test('Timestamp validation: review with malformed submittedAt is explicitly reje
     ],
   });
   const res = classifyActor(pr);
-  // Malformed review is rejected, so it does not block the PR as CHANGES_REQUESTED
+  // Malformed review cannot block author nor clear review; fails closed to indeterminate
   assert.equal(res.nextActor, 'reviewer');
-  assert.equal(res.reason, 'awaiting_review');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
 });
 
-test('Unresolved review thread on PR with deleted/null author routes to author', () => {
+test('Unresolved review thread on PR with deleted/null author does not route to author', () => {
   const threadCommentTime = hoursAgo(3);
   const pr = basePr({
     author: null,
@@ -1008,9 +1260,10 @@ test('Unresolved review thread on PR with deleted/null author routes to author',
     ],
   });
   const res = classifyActor(pr);
-  assert.equal(res.nextActor, 'author');
-  assert.equal(res.reason, 'unresolved_review_thread');
-  assert.equal(res.turnStartedAt, threadCommentTime);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
 });
 
 test('resolvedWithoutReply does not route to nextActor: author and attaches warning', () => {
@@ -1064,7 +1317,7 @@ test('resolvedWithoutReply local filtering ignores bot comments in resolved thre
       {
         isResolved: true,
         resolvedBy: 'contributor',
-        comments: [{ author: 'codecov[bot]', createdAt: hoursAgo(6) }],
+        comments: [{ author: 'codecov[bot]', authorTypename: 'Bot', createdAt: hoursAgo(6) }],
       },
     ],
   });
@@ -1128,7 +1381,7 @@ test('resolvedWithoutReply skips thread when reviewer comments have no valid tim
   assert.equal(res.warnings, undefined);
 });
 
-test('resolvedWithoutReply triggers warning when author timestamp is invalid after valid reviewer comment', () => {
+test('resolvedWithoutReply does not trigger warning when author timestamp is invalid', () => {
   const pr = basePr({
     reviews: [{ author: 'reviewer-alice', state: 'COMMENTED', submittedAt: hoursAgo(5) }],
     reviewThreads: [
@@ -1143,7 +1396,7 @@ test('resolvedWithoutReply triggers warning when author timestamp is invalid aft
     ],
   });
   const res = classifyActor(pr);
-  assert.deepEqual(res.warnings, ['resolved_without_reply']);
+  assert.equal(res.warnings, undefined);
 });
 
 test('resolvedWithoutReply with mixed reviewer timestamps uses the valid timestamp', () => {
@@ -1191,8 +1444,8 @@ test('Unresolved thread with only bot comments is ignored and does not route to 
         isResolved: false,
         resolvedBy: null,
         comments: [
-          { author: 'codecov[bot]', createdAt: hoursAgo(3) },
-          { author: 'github-actions[bot]', createdAt: hoursAgo(2) },
+          { author: 'codecov[bot]', authorTypename: 'Bot', createdAt: hoursAgo(3) },
+          { author: 'github-actions[bot]', authorTypename: 'Bot', createdAt: hoursAgo(2) },
         ],
       },
     ],
@@ -1202,7 +1455,7 @@ test('Unresolved thread with only bot comments is ignored and does not route to 
   assert.equal(res.reason, 'awaiting_review');
 });
 
-test('Unresolved review thread routes to author even when author comment has unparseable timestamp', () => {
+test('Unresolved review thread routes to reviewer uninspected_review_data when author comment has unparseable timestamp', () => {
   const pr = basePr({
     reviewThreads: [
       {
@@ -1223,12 +1476,11 @@ test('Unresolved review thread routes to author even when author comment has unp
     ],
   });
 
-  // Directly assert the premise: the upstream predicate fails to trigger due to Date.parse NaN
-  assert.equal(unresolvedFromReviewer(pr).triggered, false);
-
   const res = classifyActor(pr);
-  assert.equal(res.nextActor, 'author');
-  assert.equal(res.reason, 'unresolved_review_thread');
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
 });
 
 test('Unresolved thread with only outside contributor comments does not block author', () => {
@@ -1348,15 +1600,26 @@ test('Classifier input test: >100 commits evaluated for DCO missing', () => {
   assert.equal(res.reason, 'dco_missing');
 });
 
-test('Classifier input test: >50 comments in one review thread evaluated for latest author response', () => {
+test('Classifier input test: >50 comments in one review thread evaluated past pagination boundary (author clears blocker in tail)', () => {
+  // If only the first 50 comments (indices 0..49) were inspected, comment 49 is from reviewer-alice
+  // without an author reply, which would block the PR on author (unresolved_review_thread).
+  // Evaluating past comment 50 reveals author replies (indices 50..55), clearing the thread blocker.
+  // With an active review request for reviewer-alice, it routes to reviewer (review_requested).
   const comments = [];
-  for (let i = 0; i < 56; i++) {
+  for (let i = 0; i < 50; i++) {
     comments.push({
-      author: i % 2 === 0 ? 'reviewer-alice' : 'contributor',
-      createdAt: hoursAgo(56 - i),
+      author: i % 2 === 0 ? 'contributor' : 'reviewer-alice',
+      createdAt: hoursAgo(60 - i),
+    });
+  }
+  for (let i = 50; i < 56; i++) {
+    comments.push({
+      author: 'contributor',
+      createdAt: hoursAgo(60 - i),
     });
   }
   const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
     reviewThreads: [
       {
         isResolved: false,
@@ -1367,7 +1630,45 @@ test('Classifier input test: >50 comments in one review thread evaluated for lat
   });
   const res = classifyActor(pr);
   assert.equal(res.nextActor, 'reviewer');
-  assert.equal(res.reason, 'awaiting_review');
+  assert.equal(res.reason, 'review_requested');
+});
+
+test('Classifier input test: >50 comments in one review thread evaluated past pagination boundary (reviewer counter-reply in tail creates blocker)', () => {
+  // If only the first 50 comments (indices 0..49) were inspected, author has replied at index 49,
+  // which would clear the thread blocker and leave the PR waiting on reviewer.
+  // Evaluating past comment 50 reveals a reviewer counter-reply at comment 55, which creates
+  // a confirmed thread blocker routing to author (unresolved_review_thread).
+  const comments = [];
+  for (let i = 0; i < 50; i++) {
+    comments.push({
+      author: i % 2 === 0 ? 'reviewer-alice' : 'contributor',
+      createdAt: hoursAgo(60 - i),
+    });
+  }
+  for (let i = 50; i < 55; i++) {
+    comments.push({
+      author: 'contributor',
+      createdAt: hoursAgo(60 - i),
+    });
+  }
+  comments.push({
+    author: 'reviewer-alice',
+    createdAt: hoursAgo(1),
+  });
+
+  const pr = basePr({
+    reviews: [{ author: 'reviewer-alice', state: 'COMMENTED', submittedAt: hoursAgo(65) }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments,
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'unresolved_review_thread');
 });
 
 test('Classifier input test: >50 reviews evaluated with oldest review as sole blocker', () => {
@@ -1401,4 +1702,1768 @@ test('Classifier input test: >50 reviews evaluated with oldest review as sole bl
   const res = classifyActor(pr);
   assert.equal(res.nextActor, 'author');
   assert.equal(res.reason, 'changes_requested');
+});
+
+test('Rule 8: Approved PR with mergeable UNKNOWN routes to reviewer, not maintainer', () => {
+  const pr = basePr({
+    mergeable: 'UNKNOWN',
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('Rule 8: Approved PR with mergeable MERGEABLE routes to maintainer ready_to_merge', () => {
+  const pr = basePr({
+    mergeable: 'MERGEABLE',
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
+});
+
+test('Rule 8: Approved PR with label-only CI failure routes to maintainer needs_label', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'check-labels',
+        conclusion: 'failure',
+      },
+    ],
+    headCheckRunsTruncated: false,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'needs_label');
+});
+
+test('Rule 8: Approved PR with label-only failure but pending CI checks routes to reviewer, not maintainer', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'check-labels',
+        conclusion: 'failure',
+      },
+      {
+        name: 'unit-tests',
+        conclusion: null, // still running in background
+      },
+    ],
+    headCheckRunsTruncated: false,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  // Tests are still in progress; must not route to maintainer as ready to merge
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('Rule 8: Approved PR with mixed failure (label gate + test failure) routes to author ci_failing', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'check-labels',
+        conclusion: 'failure',
+      },
+      {
+        name: 'unit-tests',
+        conclusion: 'failure',
+      },
+    ],
+    headCheckRunsTruncated: false,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+});
+
+test('Rule 8: Approved PR with truncated checks and visible label failure routes to author ci_failing', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'check-labels',
+        conclusion: 'failure',
+      },
+    ],
+    headCheckRunsTruncated: true,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+});
+
+test('Rule 8: Approved PR with label-only CI failure and merge conflict routes to author merge_conflict', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'check-labels',
+        conclusion: 'failure',
+      },
+    ],
+    headCheckRunsTruncated: false,
+    mergeable: 'CONFLICTING',
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'merge_conflict');
+});
+
+test('Rule 8: Approved PR with label-only CI failure and active CHANGES_REQUESTED routes to author changes_requested', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'check-labels',
+        conclusion: 'failure',
+      },
+    ],
+    headCheckRunsTruncated: false,
+    mergeable: 'MERGEABLE',
+    reviews: [
+      {
+        author: 'reviewer-a',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+      {
+        author: 'reviewer-b',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(3),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'changes_requested');
+});
+
+test('Bot detection: Review from coderabbitai is ignored and does not count as human approval', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'coderabbitai',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  // No human approval exists, so it cannot be ready_to_merge
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('Bot detection: Review from coderabbitai requesting changes does not block author', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'coderabbitai',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  // Bot change request does not block author
+  assert.notEqual(res.nextActor, 'author');
+});
+
+test('Author addressing changes: Merge commit (parents > 1) does NOT clear changes requested blocker', () => {
+  const pr = basePr({
+    commits: [
+      {
+        sha: 'base001',
+        messageHeadline: 'initial commit',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(10),
+        parents: 1,
+        parentOids: ['sha-base'],
+      },
+      {
+        sha: 'merge002',
+        messageHeadline: 'Merge branch main into feat',
+        messageBody: 'Merge commit',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(1),
+        parents: 2,
+        parentOids: ['base001', 'sha-base'],
+      },
+    ],
+    reviews: [
+      {
+        author: 'reviewer-b',
+        commitOid: 'base001',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+  });
+
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'changes_requested');
+});
+
+test('Author addressing changes: Code commit (parents <= 1) DOES clear changes requested blocker', () => {
+  const pr = basePr({
+    commits: [
+      {
+        sha: 'base001',
+        messageHeadline: 'initial commit',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(10),
+        parents: 1,
+      },
+      {
+        sha: 'code002',
+        messageHeadline: 'fix: address reviewer comments',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(1),
+        parents: 1,
+        parentOids: ['base001'],
+      },
+    ],
+    reviews: [
+      {
+        author: 'reviewer-b',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+  });
+
+  const res = classifyActor(pr);
+  // Blocker cleared by code commit; moves back to reviewer
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('Truncation gating: PR with 50 reviews does not fail open into ready_to_merge', () => {
+  const reviews = [];
+  for (let i = 0; i < 50; i++) {
+    reviews.push({
+      author: `reviewer-${i}`,
+      state: 'APPROVED' as const,
+      submittedAt: hoursAgo(50 - i),
+    });
+  }
+  const pr = basePr({
+    reviews,
+    reviewsTruncated: true,
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('reviews_truncated'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Truncation gating: PR with 50 thread comments does not fail open into ready_to_merge', () => {
+  const comments = [];
+  for (let i = 0; i < 50; i++) {
+    comments.push({
+      author: 'contributor',
+      createdAt: hoursAgo(50 - i),
+    });
+  }
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-a',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments,
+        commentsTruncated: true,
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('thread_comments_truncated'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Head commit date clamping: Commit older than createdAt is clamped to createdAt', () => {
+  const pr = basePr({
+    createdAt: daysAgo(2),
+    commits: [
+      {
+        sha: 'c1',
+        messageHeadline: 'old commit rebased',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: daysAgo(10), // older than createdAt
+        parents: 1,
+      },
+    ],
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'build', conclusion: 'failure' }],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+  // Clamped to createdAt instead of daysAgo(10)
+  assert.equal(res.turnStartedAt, pr.createdAt);
+});
+
+test('Resolved thread filtering: Author reply to unresolved thread clears CHANGES_REQUESTED despite historical resolved thread', () => {
+  const pr = basePr({
+    commits: [
+      {
+        sha: 'c1',
+        messageHeadline: 'initial commit',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(10),
+        parents: 1,
+      },
+    ],
+    reviews: [
+      {
+        id: 'review-current',
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    reviewThreads: [
+      {
+        // Historical resolved thread from earlier
+        isResolved: true,
+        resolvedBy: 'reviewer-alice',
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(8) },
+          { author: 'contributor', createdAt: hoursAgo(7) },
+        ],
+      },
+      {
+        // Active thread for current review
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(4) },
+          { author: 'contributor', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+
+  const res = classifyActor(pr);
+  // Author replied to the only active thread; blocker is addressed
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('Resolved thread filtering: Author reply to review thread clears CHANGES_REQUESTED when thread is subsequently resolved', () => {
+  // If author replies after the review was submitted, and then the thread is marked resolved,
+  // the PR must remain addressed (routes to reviewer, not author).
+  const pr = basePr({
+    commits: [
+      {
+        sha: 'c1',
+        messageHeadline: 'initial commit',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        committedDate: hoursAgo(10),
+        parents: 1,
+      },
+    ],
+    reviews: [
+      {
+        id: 'review-current',
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'reviewer-alice',
+        comments: [
+          {
+            author: 'reviewer-alice',
+            createdAt: hoursAgo(4),
+            pullRequestReview: {
+              id: 'review-current',
+              state: 'CHANGES_REQUESTED',
+              submittedAt: hoursAgo(4),
+              commitOid: null,
+            },
+          },
+          { author: 'contributor', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('sameLogin rejects invalid types, empty strings, and trims whitespace safely', () => {
+  assert.equal(sameLogin(null, 'alice'), false);
+  assert.equal(sameLogin(undefined, 'alice'), false);
+  assert.equal(sameLogin('', ''), false);
+  assert.equal(sameLogin('   ', '   '), false);
+  assert.equal(sameLogin('  alice  ', 'alice'), true);
+  assert.equal(sameLogin('Alice', 'alice'), true);
+  assert.equal(sameLogin({ login: 'alice' } as any, 'alice'), false);
+  assert.equal(sameLogin(123 as any, 123 as any), false);
+});
+
+test('Outer thread truncation (reviewThreadsTruncated: true) routes to uninspected_review_data with review_threads_truncated', () => {
+  const pr = basePr({
+    reviewThreadsTruncated: true,
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_threads_truncated'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Label-only CI failure with complete check data routes to maintainer needs_label when approved and mergeable', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'check-labels',
+        conclusion: 'failure',
+      },
+    ],
+    headCheckRunsTruncated: false,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'needs_label');
+});
+
+test('Multiple completeness warnings collected in single classification', () => {
+  const pr = basePr({
+    commitsTruncated: true,
+    reviewRequestsTruncated: true,
+    reviewsTruncated: true,
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('commits_truncated'));
+  assert.ok(res.warnings?.includes('review_requests_truncated'));
+  assert.ok(res.warnings?.includes('reviews_truncated'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Maintainer top-level comment activity advances turnStartedAt in getLastReviewOrMaintainerActivity', () => {
+  const pr = basePr({
+    mergeable: 'CONFLICTING',
+    comments: [
+      {
+        author: 'maintainer-sam',
+        authorAssociation: 'MEMBER',
+        createdAt: hoursAgo(1),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'merge_conflict');
+  assert.equal(res.turnStartedAt, hoursAgo(1));
+});
+
+test('Missing headCheckRuns with FAILURE rollup routes to author ci_failing', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: undefined,
+    headCheckRunsTruncated: undefined as any,
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+});
+
+test('Partially invalid reviewer timestamps in CHANGES_REQUESTED fail closed to indeterminate', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(3) },
+          { author: 'reviewer-alice', createdAt: 'corrupted-timestamp' },
+          { author: 'contributor', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing PR author identity prevents human approval from qualifying for ready_to_merge', () => {
+  const pr = basePr({
+    author: null,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(2),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Multiple open threads in CHANGES_REQUESTED: confirmed blocker wins over indeterminate thread', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    reviewThreads: [
+      {
+        // Thread 1: Indeterminate due to invalid timestamp
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', createdAt: 'invalid-timestamp' }],
+      },
+      {
+        // Thread 2: Confirmed blocker (reviewer comment complete, no author reply)
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(4) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'changes_requested');
+});
+
+test('Multiple open threads in CHANGES_REQUESTED: indeterminate when no confirmed blocker exists', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    reviewThreads: [
+      {
+        // Thread 1: Indeterminate due to invalid timestamp
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', createdAt: 'invalid-timestamp' }],
+      },
+      {
+        // Thread 2: Verified replied by author
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(4) },
+          { author: 'contributor', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Precedence 5: Multiple threads where confirmed blocker wins over indeterminate thread', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        // Thread 1: Indeterminate due to invalid reviewer timestamp
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', createdAt: 'invalid-timestamp' }],
+      },
+      {
+        // Thread 2: Confirmed blocker (unanswered reviewer comment)
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(4) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'unresolved_review_thread');
+});
+
+test('Precedence 5: Multiple threads where indeterminate evidence routes to reviewer when no blocker exists', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        // Thread 1: Indeterminate due to invalid reviewer timestamp
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', createdAt: 'invalid-timestamp' }],
+      },
+      {
+        // Thread 2: Addressed (author replied)
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(4) },
+          { author: 'contributor', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Precedence 5: Incomplete thread (commentsTruncated: true) routes to reviewer before waiting-for-author label', () => {
+  const pr = basePr({
+    labels: ['waiting-for-author'],
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: true,
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(3) },
+          { author: 'contributor', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('thread_comments_truncated'));
+});
+
+test('CHANGES_REQUESTED with invalid reviewSubmittedAt fails closed to indeterminate', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: 'corrupted-timestamp',
+      },
+    ],
+    reviewThreads: [],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing PR author identity in thread does not classify as author blocker', () => {
+  const pr = basePr({
+    author: null,
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(3) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Truncated comments hiding reviewer participation prevents false addressed state', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    reviewThreads: [
+      {
+        // Thread does not visibly list reviewer-alice, but comments are truncated
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: true,
+        comments: [{ author: 'other-user', createdAt: hoursAgo(4) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('thread_comments_truncated'));
+});
+
+test('hasAuthorResolvedWithoutReply: Partially invalid reviewer timestamp does not attach resolved_without_reply', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(4) },
+          { author: 'reviewer-alice', createdAt: 'corrupted-date' },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.ok(!res.warnings?.includes('resolved_without_reply'));
+});
+
+test('hasAuthorResolvedWithoutReply: Partially invalid author timestamp does not attach resolved_without_reply', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(4) },
+          { author: 'contributor', createdAt: 'corrupted-date' },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.ok(!res.warnings?.includes('resolved_without_reply'));
+});
+
+test('hasAuthorResolvedWithoutReply: All valid timestamps with no author reply attaches resolved_without_reply', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(4) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.ok(res.warnings?.includes('resolved_without_reply'));
+});
+
+test('Precedence 5: Unresolved thread with 0 comments and commentsTruncated: true routes to reviewer uninspected_review_data', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: true,
+        comments: [],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('thread_comments_truncated'));
+});
+
+test('Precedence 5: Unresolved thread with comments not from reviewer and commentsTruncated: true routes to reviewer uninspected_review_data', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: true,
+        comments: [{ author: 'other-user', createdAt: hoursAgo(2) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('thread_comments_truncated'));
+});
+
+test('Precedence 5: Incomplete thread alongside confirmed blocker routes to author unresolved_review_thread', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        // Thread 1: Incomplete with zero comments
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: true,
+        comments: [],
+      },
+      {
+        // Thread 2: Complete confirmed blocker
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(3) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'unresolved_review_thread');
+});
+
+test('Readiness / Precedence 8: SUCCESS rollup with missing headCheckRuns can reach ready_to_merge', () => {
+  const pr = basePr({
+    statusCheckRollup: 'SUCCESS',
+    headCheckRuns: undefined,
+    headCheckRunsTruncated: undefined as any,
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
+});
+
+test('Missing PR author identity with matching user re-request fails closed to indeterminate', () => {
+  const pr = basePr({
+    author: null,
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    reviewThreads: [],
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Review timestamp ordering: valid APPROVED followed by malformed CHANGES_REQUESTED produces indeterminate', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(8),
+      },
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: 'invalid-date',
+      },
+    ],
+    statusCheckRollup: 'SUCCESS',
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Review timestamp ordering: malformed CHANGES_REQUESTED followed by valid APPROVED produces indeterminate', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: 'invalid-date',
+      },
+      {
+        author: 'reviewer-alice',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(8),
+      },
+    ],
+    statusCheckRollup: 'SUCCESS',
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Valid CHANGES_REQUESTED from reviewer A + invalid review timestamp from reviewer B routes to author', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+      {
+        author: 'reviewer-bob',
+        state: 'APPROVED',
+        submittedAt: 'invalid-date',
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(3) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'changes_requested');
+});
+
+test('Invalid review timestamp from reviewer A + valid APPROVED from reviewer B routes to reviewer indeterminate', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: 'invalid-date',
+      },
+      {
+        author: 'reviewer-bob',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    statusCheckRollup: 'SUCCESS',
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing author identity + confirmed CHANGES_REQUESTED routes conservatively to reviewer indeterminate', () => {
+  const pr = basePr({
+    author: null,
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(3) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing author identity + unidentified commenter in an open thread routes to reviewer indeterminate', () => {
+  // With pr.author === null, the commenter 'someone' cannot be verified as the PR author.
+  // Missing author identity prevents classifying changes requested as addressed or attributing
+  // responsibility, failing closed into reviewer indeterminate.
+  const pr = basePr({
+    author: null,
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [
+          { author: 'reviewer-alice', createdAt: hoursAgo(3) },
+          { author: 'someone', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Invalid timestamp on a bot review must not create human-review uncertainty', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'codecov',
+        authorTypename: 'Bot',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: 'invalid-date',
+      },
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    statusCheckRollup: 'SUCCESS',
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
+});
+
+test('Invalid timestamp on a PR-author review must not create reviewer-state uncertainty', () => {
+  const pr = basePr({
+    author: { login: 'contributor', typename: 'User' },
+    reviews: [
+      {
+        author: 'contributor',
+        authorTypename: 'User',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: 'invalid-date',
+      },
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+    statusCheckRollup: 'SUCCESS',
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
+});
+
+test('Valid reviewer blocker + unrelated truncated thread routes to author unresolved_review_thread', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: true,
+        comments: [],
+      },
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [{ author: 'reviewer-alice', createdAt: hoursAgo(3) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'unresolved_review_thread');
+});
+
+test('Precedence 8: Missing PR author identity on complete PR routes to reviewer uninspected_review_data', () => {
+  const pr = basePr({
+    author: null,
+    reviews: [],
+    reviewThreads: [],
+    reviewRequests: [],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Malformed human DISMISSED review produces indeterminate reviewer review state', () => {
+  // A DISMISSED review from a human reviewer supersedes earlier reviews from that reviewer.
+  // If submittedAt is malformed, that reviewer cannot be resolved, creating review-state uncertainty
+  // and routing to reviewer uninspected_review_data with review_timestamps_invalid.
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'DISMISSED',
+        submittedAt: 'invalid-date',
+      },
+    ],
+    statusCheckRollup: 'SUCCESS',
+    mergeable: 'MERGEABLE',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing author + waiting-for-author label routes to reviewer uninspected_review_data', () => {
+  const pr = basePr({
+    author: null,
+    labels: ['waiting-for-author'],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing author + pending review request routes to reviewer uninspected_review_data', () => {
+  const pr = basePr({
+    author: null,
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing author + draft PR routes to reviewer uninspected_review_data', () => {
+  const pr = basePr({
+    author: null,
+    isDraft: true,
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Explicit GraphQL User typename on known dependabot login still routes to dependency bot', () => {
+  const pr = basePr({
+    author: { login: 'dependabot', typename: 'User' },
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'bot');
+  assert.equal(res.isDependencyBot, true);
+});
+
+test('Explicit GraphQL Bot typename on dependabot author routes to dependency bot', () => {
+  const pr = basePr({
+    author: { login: 'dependabot', typename: 'Bot' },
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'bot');
+  assert.equal(res.isDependencyBot, true);
+  assert.equal(res.reason, 'dependency_bot');
+});
+
+test('Confirmed merge conflict + truncated CI routes to author ci_failing', () => {
+  const pr = basePr({
+    mergeable: 'CONFLICTING',
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: undefined,
+    headCheckRunsTruncated: true,
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+});
+
+test('Confirmed DCO missing + truncated CI routes to author ci_failing', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: undefined,
+    headCheckRunsTruncated: true,
+    commits: [
+      {
+        sha: 'abc1234',
+        messageHeadline: 'feat: missing dco',
+        messageBody: 'No signoff here',
+        authorEmail: 'contributor@example.com',
+        committedDate: daysAgo(5),
+        parents: 1,
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+});
+
+test('Confirmed changes requested + truncated CI routes to author ci_failing', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: undefined,
+    headCheckRunsTruncated: true,
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(4),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+});
+
+test('Confirmed thread blocker + truncated CI routes to author ci_failing', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: undefined,
+    headCheckRunsTruncated: true,
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(3) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'ci_failing');
+});
+
+test('Indeterminate CHANGES_REQUESTED evidence from reviewer A + confirmed unresolved thread from reviewer B routes to author', () => {
+  // Reviewer A has changes requested with an indeterminate thread (truncated comments).
+  // Reviewer B has an active review request and a complete unresolved thread with an unreplied comment.
+  // Precedence 4 indeterminate review evidence must NOT return early; it must proceed to
+  // Precedence 5 where Reviewer B's confirmed blocker wins, routing to author unresolved_review_thread.
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-bob' }],
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(6),
+      },
+    ],
+    reviewThreads: [
+      {
+        // Reviewer A's thread: indeterminate due to truncated comments
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: true,
+        comments: [{ author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(5) }],
+      },
+      {
+        // Reviewer B's thread: confirmed blocker in complete thread
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [{ author: 'reviewer-bob', authorTypename: 'User', createdAt: hoursAgo(3) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'unresolved_review_thread');
+});
+
+test('Bot comment carrying author login in resolved thread does not count as human author reply in hasAuthorResolvedWithoutReply', () => {
+  // A bot comment with author login but authorTypename: 'Bot' must not count as a verified human reply,
+  // attaching the resolved_without_reply warning.
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'COMMENTED',
+        submittedAt: hoursAgo(8),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        comments: [
+          { author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(8) },
+          { author: 'contributor', authorTypename: 'Bot', createdAt: hoursAgo(6) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.ok(res.warnings?.includes('resolved_without_reply'));
+});
+
+test('Bot comment carrying reviewer login in review thread does not count as reviewer participation', () => {
+  // A bot comment matching reviewer login but having authorTypename: 'Bot' must not be treated as human reviewer comment
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'COMMENTED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          { author: 'contributor', authorTypename: 'User', createdAt: hoursAgo(10) },
+          { author: 'reviewer-alice', authorTypename: 'Bot', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('Shared predicate false + locally confirmed blocker routes to author unresolved_review_thread', () => {
+  // In unresolvedFromReviewer, latest comment is from author login (contributor), so unresolvedFromReviewer is false.
+  // But that comment has authorTypename: 'Bot', which is rejected by local identity validation.
+  // The local scan recognizes reviewer-alice as the latest verified human comment unreplied, routing to author.
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          {
+            author: 'reviewer-alice',
+            authorTypename: 'User',
+            createdAt: hoursAgo(4),
+            commitOid: 'abc1234',
+            originalCommitOid: 'abc1234',
+          },
+          { author: 'contributor', authorTypename: 'Bot', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'unresolved_review_thread');
+});
+
+test('Shared predicate true + only bot participation does not create author blocker', () => {
+  // unresolvedFromReviewer triggers because latest comment author !== authorLogin ('codecov' !== 'contributor').
+  // Local identity scan verifies that codecov is a bot, so it does NOT create an author blocker.
+  const pr = basePr({
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          { author: 'contributor', authorTypename: 'User', createdAt: hoursAgo(5) },
+          { author: 'codecov', authorTypename: 'Bot', createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'awaiting_review');
+});
+
+test('Invalid review timestamp + truncated commits preserves both review_timestamps_invalid and commits_truncated', () => {
+  const pr = basePr({
+    commitsTruncated: true,
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: 'invalid-date',
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_timestamps_invalid'));
+  assert.ok(res.warnings?.includes('commits_truncated'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('isBotLogin relies on explicit [bot] suffix and KNOWN_BOT_LOGINS allowlist without broad -bot matching', () => {
+  assert.equal(isBotLogin('codecov'), true);
+  assert.equal(isBotLogin('codecov[bot]'), true);
+  assert.equal(isBotLogin('snyk-bot'), true);
+  assert.equal(isBotLogin('renovate-bot'), true);
+  assert.equal(isBotLogin('developer-bot'), false);
+});
+
+test('Missing author + confirmed CI failure routes to reviewer ci_failing with completeness warnings', () => {
+  const pr = basePr({
+    author: null,
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [
+      {
+        name: 'build',
+        conclusion: 'failure',
+      },
+    ],
+    headCheckRunsTruncated: false,
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'ci_failing');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing author + confirmed merge conflict routes to reviewer merge_conflict with completeness warnings', () => {
+  const pr = basePr({
+    author: null,
+    mergeable: 'CONFLICTING',
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'merge_conflict');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Missing author + confirmed DCO missing routes to reviewer dco_missing with completeness warnings', () => {
+  const pr = basePr({
+    author: null,
+    commits: [
+      {
+        sha: 'abc1234',
+        messageHeadline: 'feat: change without signoff',
+        messageBody: 'No DCO signoff here',
+        authorEmail: 'contributor@example.com',
+        committedDate: daysAgo(3),
+        parents: 1,
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'dco_missing');
+  assert.ok(res.warnings?.includes('author_identity_unavailable'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Case-differing author login in resolved thread attaches resolved_without_reply independently', () => {
+  // Author login is 'Contributor' (User), thread resolvedBy is 'CONTRIBUTOR'.
+  // The shared predicate resolvedWithoutReply checks t.resolvedBy === authorLogin (case-sensitive),
+  // which returns false. The local identity-verified scan performs case-insensitive matching
+  // and attaches resolved_without_reply.
+  const pr = basePr({
+    author: { login: 'Contributor', typename: 'User' },
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'COMMENTED',
+        submittedAt: hoursAgo(8),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'CONTRIBUTOR',
+        comments: [{ author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(6) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.ok(res.warnings?.includes('resolved_without_reply'));
+});
+
+test('Tri-state actor identity: typename authority and bot fallback', () => {
+  // Missing typename + known bot login ('codecov') -> non_human
+  assert.equal(getActorIdentityKind(null, 'codecov'), 'non_human');
+  assert.equal(getActorIdentityKind(undefined, 'codecov[bot]'), 'non_human');
+
+  // Missing typename + unknown ordinary login -> unknown
+  assert.equal(getActorIdentityKind(null, 'contributor'), 'unknown');
+  assert.equal(getActorIdentityKind(undefined, 'reviewer-alice'), 'unknown');
+
+  // Known bot logins remain non-human even when GraphQL reports User.
+  assert.equal(getActorIdentityKind('User', 'codecov'), 'non_human');
+  assert.equal(getActorIdentityKind('EnterpriseUserAccount', 'dependabot'), 'non_human');
+
+  // Explicit Bot + ordinary login -> non_human
+  assert.equal(getActorIdentityKind('Bot', 'contributor'), 'non_human');
+});
+
+test('Unknown-identity reviewer comment in open thread produces indeterminate classification', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [{ author: 'reviewer-alice', authorTypename: null, createdAt: hoursAgo(5) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Unknown-identity author comment after reviewer produces indeterminate classification (not confirmed blocker)', () => {
+  const pr = basePr({
+    reviewRequests: [{ kind: 'user', login: 'reviewer-alice' }],
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        comments: [
+          { author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(5) },
+          { author: 'contributor', authorTypename: null, createdAt: hoursAgo(2) },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Unknown-identity author comment with invalid timestamp in resolved thread does not attach resolved_without_reply', () => {
+  const pr = basePr({
+    author: { login: 'contributor', typename: 'User' },
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'COMMENTED',
+        submittedAt: hoursAgo(8),
+      },
+    ],
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        comments: [
+          { author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(6) },
+          { author: 'contributor', authorTypename: null, createdAt: 'invalid-date' },
+        ],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.ok(!res.warnings?.includes('resolved_without_reply'));
+});
+
+test('Historical reviewer thread complete + unrelated historical thread with truncated comments produces indeterminate in evaluateChangesRequestedForReviewer', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(10),
+      },
+    ],
+    reviewThreads: [
+      {
+        // Thread A: resolved, complete, reviewer participated, author replied
+        isResolved: true,
+        resolvedBy: 'contributor',
+        commentsTruncated: false,
+        comments: [
+          { author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(9) },
+          { author: 'contributor', authorTypename: 'User', createdAt: hoursAgo(7) },
+        ],
+      },
+      {
+        // Thread B: resolved, but comments truncated (could hide unreplied reviewer-alice participation)
+        isResolved: true,
+        resolvedBy: 'someone-else',
+        commentsTruncated: true,
+        comments: [{ author: 'bob', authorTypename: 'User', createdAt: hoursAgo(5) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'reviewer');
+  assert.equal(res.reason, 'uninspected_review_data');
+  assert.ok(res.warnings?.includes('thread_comments_truncated'));
+  assert.ok(res.warnings?.includes('review_data_incomplete'));
+});
+
+test('Confirmed blocker plus unrelated truncated historical thread: confirmed blocker wins', () => {
+  const pr = basePr({
+    reviews: [
+      {
+        author: 'reviewer-alice',
+        authorTypename: 'User',
+        state: 'CHANGES_REQUESTED',
+        submittedAt: hoursAgo(10),
+      },
+    ],
+    reviewThreads: [
+      {
+        // Thread A: open confirmed blocker for reviewer-alice
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [{ author: 'reviewer-alice', authorTypename: 'User', createdAt: hoursAgo(9) }],
+      },
+      {
+        // Thread B: unrelated historical resolved thread with truncated comments
+        isResolved: true,
+        resolvedBy: 'contributor',
+        commentsTruncated: true,
+        comments: [{ author: 'bob', authorTypename: 'User', createdAt: hoursAgo(5) }],
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'author');
+  assert.equal(res.reason, 'changes_requested');
+});
+
+test('ciFailing: undefined headCheckRunsTruncated is not treated as verified complete label-only', () => {
+  const pr = basePr({
+    statusCheckRollup: 'FAILURE',
+    headCheckRuns: [{ name: 'check-label', conclusion: 'failure' }],
+    headCheckRunsTruncated: undefined,
+  });
+  const res = ciFailing(pr);
+  assert.equal(res.triggered, true);
+  assert.equal(res.labelOnlyFailure, false);
+});
+
+test('Known dependency bot login remains classified as dependency bot with User typename', () => {
+  assert.equal(isDependencyBotAuthor('renovate', 'User'), true);
+  assert.equal(isDependencyBotAuthor('renovate', 'Bot'), true);
+  assert.equal(isDependencyBotAuthor('renovate'), true);
 });

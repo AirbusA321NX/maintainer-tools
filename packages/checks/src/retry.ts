@@ -29,10 +29,7 @@ function isRateLimitError(error: unknown): boolean {
   if (status === 429 || (status === 403 && headerValue(error, 'x-ratelimit-remaining') === '0')) {
     return true;
   }
-  if (
-    headerValue(error, 'retry-after') !== undefined ||
-    headerValue(error, 'x-ratelimit-reset') !== undefined
-  ) {
+  if (headerValue(error, 'retry-after') !== undefined) {
     return true;
   }
   return (
@@ -59,7 +56,7 @@ function rateLimitWaitMs(error: unknown, attempt: number): number {
 
   const reset = Number(headerValue(error, 'x-ratelimit-reset'));
   if (Number.isFinite(reset) && reset > 0) {
-    return Math.min(MAX_RATE_LIMIT_WAIT_MS, Math.max(0, reset * 1000 - Date.now()));
+    return Math.min(MAX_RATE_LIMIT_WAIT_MS, Math.max(1000, reset * 1000 - Date.now()));
   }
 
   return Math.min(MAX_RATE_LIMIT_WAIT_MS, 1000 * 2 ** attempt);

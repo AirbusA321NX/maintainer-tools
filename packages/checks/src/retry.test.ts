@@ -101,3 +101,73 @@ test('retryRequest reads case-insensitive plain-object rate-limit headers', asyn
 
   assert.deepEqual(waits, [3000]);
 });
+
+test('retryRequest does not treat a reset telemetry header as rate limiting', async () => {
+  const waits: number[] = [];
+  let calls = 0;
+  await assert.rejects(
+    retryRequest(
+      async () => {
+        calls += 1;
+        throw Object.assign(new Error('bad request'), {
+          status: 400,
+          response: { headers: { 'x-ratelimit-reset': '9999999999' } },
+        });
+      },
+      async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    ),
+    { message: 'bad request' },
+  );
+
+  assert.equal(calls, 1);
+  assert.deepEqual(waits, []);
+});
+
+test('retryRequest uses transport backoff for server errors with reset telemetry', async () => {
+  const waits: number[] = [];
+  let calls = 0;
+  await assert.rejects(
+    retryRequest(
+      async () => {
+        calls += 1;
+        throw Object.assign(new Error('server error'), {
+          status: 500,
+          response: { headers: { 'x-ratelimit-reset': '9999999999' } },
+        });
+      },
+      async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    ),
+    { message: 'server error' },
+  );
+
+  assert.equal(calls, 3);
+  assert.deepEqual(waits, [1000, 2000]);
+});
+
+test('retryRequest applies a minimum delay when the rate-limit reset has passed', async () => {
+  const waits: number[] = [];
+  let calls = 0;
+  await assert.doesNotReject(() =>
+    retryRequest(
+      async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw Object.assign(new Error('rate limited'), {
+            status: 429,
+            response: { headers: { 'x-ratelimit-reset': '1' } },
+          });
+        }
+        return undefined;
+      },
+      async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    ),
+  );
+
+  assert.deepEqual(waits, [1000]);
+});

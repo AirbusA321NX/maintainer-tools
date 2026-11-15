@@ -191,7 +191,9 @@ export function getLastReviewOrMaintainerActivityState(
           comment.author &&
           isHumanActor(comment.authorTypename, comment.author) &&
           !sameLogin(comment.author, authorLogin) &&
-          candidateLogins.has(comment.author.toLowerCase())
+          (candidateLogins.has(comment.author.toLowerCase()) ||
+            (maintainerConfig?.status === 'available' &&
+              hasLogin(maintainerConfig.logins, comment.author)))
         ) {
           if (parseDateSafe(comment.createdAt) === 0) {
             hasInvalidActivityTimestamp = true;
@@ -962,7 +964,7 @@ function hasAuthorResolvedWithoutReply(
         hasSuppressionComment = true;
         break;
       }
-      if (timeMs > latestReviewerMs) {
+      if (timeMs >= latestReviewerMs) {
         // Either verified human or unknown identity posted after latest reviewer comment
         hasSuppressionComment = true;
         break;

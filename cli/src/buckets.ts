@@ -8,7 +8,7 @@
 import { type CheckResult, type PullRequest, runAll } from '@jaegertracing/maintainer-tools-checks';
 
 import { type CopilotReview, copilotReview } from './copilot.js';
-import { hasLogin, isBotAuthor, isDependencyBotAuthor, sameLogin } from './logins.js';
+import { hasLogin, isBotAuthor, isBotLogin, isDependencyBotAuthor, sameLogin } from './logins.js';
 
 export type Bucket =
   | 'priority-authors'
@@ -462,12 +462,14 @@ function countResolvedWithoutReply(pr: PullRequest): number {
   if (!authorLogin) return 0;
   let n = 0;
   for (const t of pr.reviewThreads ?? []) {
-    if (!t.isResolved || t.resolvedBy !== authorLogin) continue;
-    const reviewerComments = t.comments.filter((c) => c.author && c.author !== authorLogin);
+    if (!t.isResolved || !sameLogin(t.resolvedBy, authorLogin)) continue;
+    const reviewerComments = t.comments.filter(
+      (c) => c.author && !sameLogin(c.author, authorLogin) && !isBotLogin(c.author),
+    );
     if (reviewerComments.length === 0) continue;
     const latest = Math.max(...reviewerComments.map((c) => Date.parse(c.createdAt)));
     const replied = t.comments.some(
-      (c) => c.author === authorLogin && Date.parse(c.createdAt) > latest,
+      (c) => sameLogin(c.author, authorLogin) && Date.parse(c.createdAt) >= latest,
     );
     if (!replied) n++;
   }

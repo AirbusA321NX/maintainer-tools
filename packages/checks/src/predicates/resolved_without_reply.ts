@@ -1,4 +1,5 @@
 import type { CheckResult, PullRequest } from '../types.js';
+import { isBotLogin, sameLogin } from '../logins.js';
 
 // Triggers when the PR author resolved one or more review threads without
 // posting a reply to the most recent reviewer comment first. This is the
@@ -15,14 +16,16 @@ export function resolvedWithoutReply(pr: PullRequest): CheckResult {
   let offenderCount = 0;
   for (const t of threads) {
     if (!t.isResolved) continue;
-    if (t.resolvedBy !== authorLogin) continue;
+    if (!sameLogin(t.resolvedBy, authorLogin)) continue;
     // Find the most recent reviewer comment in this thread.
-    const reviewerComments = t.comments.filter((c) => c.author && c.author !== authorLogin);
+    const reviewerComments = t.comments.filter(
+      (c) => c.author && !sameLogin(c.author, authorLogin) && !isBotLogin(c.author),
+    );
     if (reviewerComments.length === 0) continue;
     const latestReviewer = Math.max(...reviewerComments.map((c) => Date.parse(c.createdAt)));
     // Did the author post a comment in this thread after the reviewer's latest?
     const replied = t.comments.some(
-      (c) => c.author === authorLogin && Date.parse(c.createdAt) > latestReviewer,
+      (c) => sameLogin(c.author, authorLogin) && Date.parse(c.createdAt) >= latestReviewer,
     );
     if (!replied) offenderCount++;
   }

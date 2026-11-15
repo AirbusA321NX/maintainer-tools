@@ -76,3 +76,28 @@ test('retryRequest caps excessive rate-limit waits', async () => {
 
   assert.deepEqual(waits, [60_000]);
 });
+
+test('retryRequest reads case-insensitive plain-object rate-limit headers', async () => {
+  const waits: number[] = [];
+  let calls = 0;
+  await assert.doesNotReject(() =>
+    retryRequest(
+      async () => {
+        calls += 1;
+        if (calls === 1) {
+          const error = Object.assign(new Error('rate limited'), {
+            status: 429,
+            response: { headers: { 'Retry-After': '3' } },
+          });
+          throw error;
+        }
+        return undefined;
+      },
+      async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    ),
+  );
+
+  assert.deepEqual(waits, [3000]);
+});

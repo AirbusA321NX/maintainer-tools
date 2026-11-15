@@ -13,7 +13,9 @@ function headerValue(error: unknown, name: string): string | undefined {
   if (typeof (headers as Headers).get === 'function') {
     return (headers as Headers).get(name) ?? undefined;
   }
-  const value = (headers as Record<string, string | number | undefined>)[name.toLowerCase()];
+  const record = headers as Record<string, string | number | undefined>;
+  const key = Object.keys(record).find((entry) => entry.toLowerCase() === name.toLowerCase());
+  const value = key === undefined ? undefined : record[key];
   return value === undefined ? undefined : String(value);
 }
 

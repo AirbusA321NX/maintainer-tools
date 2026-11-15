@@ -516,7 +516,7 @@ test('author replies in an inline review thread count as revision activity', () 
   assert.equal(classify(pr, context).bucket, 'changes-requested-revised');
 });
 
-test('a comment after a change request does not move the revision baseline', () => {
+test('a later reviewer comment moves the revision baseline', () => {
   const pr = pullRequest({
     commits: [
       {
@@ -535,11 +535,13 @@ test('a comment after a change request does not move the revision baseline', () 
     comments: [{ author: 'contributor', createdAt: hoursAgo(3.5) }],
   });
 
-  assert.equal(classify(pr, context).bucket, 'changes-requested-revised');
+  assert.equal(classify(pr, context).bucket, 'hidden');
 });
 
 test('CODEOWNERS directory and basename patterns match repository paths', () => {
   assert.equal(matchesGlob('pkg/main.go', 'pkg/'), true);
+  assert.equal(matchesGlob('pkg/docs/README.md', 'docs/'), true);
+  assert.equal(matchesGlob('docs/README.md', '/docs/'), true);
   assert.equal(matchesGlob('pkg/main.go', '*.go'), true);
   assert.equal(matchesGlob('pkg/main.ts', '*.go'), false);
 });

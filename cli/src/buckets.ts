@@ -146,7 +146,9 @@ export function classify(pr: PullRequest, ctx: ClassifyContext): ClassifiedPR {
   const hideReasons: string[] = [];
   if (pr.isDraft) hideReasons.push('draft');
   hideReasons.push(...hiddenByChecks.map((c) => `hide:${c.id}`));
-  if (pr.labels.includes('waiting-for-author')) hideReasons.push('waiting-for-author');
+  if (pr.labels.some((label) => label.trim().toLowerCase() === 'waiting-for-author')) {
+    hideReasons.push('waiting-for-author');
+  }
   if (changesRequestedPending) hideReasons.push('changes-requested');
   if (isBotAuthor(pr) && !isDependencyBot(pr)) hideReasons.push('bot-authored');
   const facets: Facets = {
@@ -191,7 +193,10 @@ export function classify(pr: PullRequest, ctx: ClassifyContext): ClassifiedPR {
       hiddenByChecks.map((c) => `hide:${c.id}`),
     );
   }
-  if (pr.labels.includes('waiting-for-author') && !explicitlyRequested) {
+  if (
+    pr.labels.some((label) => label.trim().toLowerCase() === 'waiting-for-author') &&
+    !explicitlyRequested
+  ) {
     return mk('hidden', ['waiting-for-author']);
   }
   // The mirror of `changes-requested-revised` below: the viewer asked for
@@ -313,11 +318,9 @@ function authorActedSinceViewerReview(
   viewerReviews: PullRequest['reviews'],
   viewer: string,
 ): boolean {
-  const authoritativeReviews = viewerReviews.filter(
-    (r) => r.state !== 'COMMENTED' && r.state !== 'PENDING',
-  );
-  const baselineReviews = authoritativeReviews.length > 0 ? authoritativeReviews : viewerReviews;
-  const latest = baselineReviews
+  // Review decisions determine the bucket state, but every submitted review
+  // is reviewer activity and therefore moves the revision baseline.
+  const latest = viewerReviews
     .map((r) => Date.parse(r.submittedAt))
     .filter((timestamp) => Number.isFinite(timestamp))
     .reduce((a, b) => Math.max(a, b), 0);
@@ -355,11 +358,14 @@ function authorActedSinceViewerReview(
 // style paths. We don't implement negation or character classes — neither
 // is needed for the triage use case.
 export function matchesGlob(path: string, pattern: string): boolean {
-  const directoryPattern = pattern.endsWith('/');
-  const hasSlash = pattern.includes('/');
-  const source = directoryPattern ? `${pattern}**` : pattern;
+  const rooted = pattern.startsWith('/');
+  const withoutRoot = rooted ? pattern.slice(1) : pattern;
+  const directoryPattern = withoutRoot.endsWith('/');
+  const core = directoryPattern ? withoutRoot.slice(0, -1) : withoutRoot;
+  const hasSlash = core.includes('/');
+  const source = directoryPattern ? `${core}/**` : core;
   const re = new RegExp(
-    (hasSlash ? '^' : '^(?:.*/)?') +
+    (rooted || hasSlash ? '^' : '^(?:.*/)?') +
       source
         .split(/(\*\*|\*)/)
         .map((token) => {
@@ -391,7 +397,9 @@ function computeFlags(pr: PullRequest, checks: CheckResult[], ctx: ClassifyConte
   if (checks.some((c) => c.id === 'merge_conflict' && c.triggered)) flags.push('MERGE-CONFLICT');
   if (checks.some((c) => c.id === 'stale_on_author' && c.triggered)) flags.push('STALE');
   if (pr.labels.includes('awaiting-maintainer-input')) flags.push('QUESTION');
-  if (pr.labels.includes('waiting-for-author')) flags.push('WAITING-FOR-AUTHOR');
+  if (pr.labels.some((label) => label.trim().toLowerCase() === 'waiting-for-author')) {
+    flags.push('WAITING-FOR-AUTHOR');
+  }
 
   // P3 predicates: each fires as a visible row flag when triggered. These
   // checks are advisory (no hide rule beyond `description_empty`, which

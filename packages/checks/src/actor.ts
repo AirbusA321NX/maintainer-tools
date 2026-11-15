@@ -195,13 +195,21 @@ export function getLastReviewOrMaintainerActivityState(
             (maintainerConfig?.status === 'available' &&
               hasLogin(maintainerConfig.logins, comment.author)))
         ) {
+          const isReviewer = candidateLogins.has(comment.author.toLowerCase());
           if (parseDateSafe(comment.createdAt) === 0) {
             hasInvalidActivityTimestamp = true;
             continue;
           }
-          if (isLater(comment.createdAt, latest)) {
-            latest = comment.createdAt;
+          if (
+            maintainerConfig?.status === 'unavailable' &&
+            !isReviewer &&
+            (comment.authorAssociation === 'OWNER' ||
+              comment.authorAssociation === 'MEMBER' ||
+              comment.authorAssociation === 'COLLABORATOR')
+          ) {
+            hasMaintainerConfigUncertainty = true;
           }
+          if (isLater(comment.createdAt, latest)) latest = comment.createdAt;
         }
       }
     }

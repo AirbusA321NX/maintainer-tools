@@ -189,6 +189,7 @@ function basePr(overrides: PullRequestOverrides = {}): PullRequest {
     createdAt: daysAgo(5),
     updatedAt: hoursAgo(2),
     labels: [],
+    labelsTruncated: false,
     additions: 10,
     deletions: 2,
     changedFiles: 1,
@@ -1723,6 +1724,22 @@ test('Rule 8: Approved PR with mergeable UNKNOWN routes to reviewer, not maintai
 test('Rule 8: Approved PR with mergeable MERGEABLE routes to maintainer ready_to_merge', () => {
   const pr = basePr({
     mergeable: 'MERGEABLE',
+    reviews: [
+      {
+        author: 'maintainer-charlie',
+        state: 'APPROVED',
+        submittedAt: hoursAgo(5),
+      },
+    ],
+  });
+  const res = classifyActor(pr);
+  assert.equal(res.nextActor, 'maintainer');
+  assert.equal(res.reason, 'ready_to_merge');
+});
+
+test('Rule 8: Truncated labels do not block an approved PR with successful CI', () => {
+  const pr = basePr({
+    labelsTruncated: true,
     reviews: [
       {
         author: 'maintainer-charlie',

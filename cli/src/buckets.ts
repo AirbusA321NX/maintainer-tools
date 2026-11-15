@@ -285,17 +285,24 @@ function hasMaintainerActivity(pr: PullRequest, maintainers: Set<string>): boole
   for (const c of pr.comments) {
     if (c.author && hasLogin(maintainers, c.author)) return true;
   }
+  for (const thread of pr.reviewThreads ?? []) {
+    for (const c of thread.comments) {
+      if (c.author && hasLogin(maintainers, c.author)) return true;
+    }
+  }
   return false;
 }
 
-// State of the viewer's most recent submitted review. GitHub keeps the whole
-// history, and a later APPROVED or COMMENTED supersedes an earlier
-// CHANGES_REQUESTED, so only the newest one says where the PR stands.
+// State of the viewer's most recent authoritative submitted review. COMMENTED
+// and PENDING are discussion/workflow states, not review decisions, so they
+// cannot clear an active CHANGES_REQUESTED review.
 function latestReviewState(
   reviews: PullRequest['reviews'],
 ): PullRequest['reviews'][number]['state'] | null {
   let latest: PullRequest['reviews'][number] | undefined;
   for (const r of reviews) {
+    if (r.state === 'COMMENTED' || r.state === 'PENDING') continue;
+    if (!r.submittedAt || Number.isNaN(Date.parse(r.submittedAt))) continue;
     if (!latest || Date.parse(r.submittedAt) > Date.parse(latest.submittedAt)) latest = r;
   }
   return latest?.state ?? null;
@@ -306,8 +313,13 @@ function authorActedSinceViewerReview(
   viewerReviews: PullRequest['reviews'],
   viewer: string,
 ): boolean {
-  const latest = viewerReviews
+  const authoritativeReviews = viewerReviews.filter(
+    (r) => r.state !== 'COMMENTED' && r.state !== 'PENDING',
+  );
+  const baselineReviews = authoritativeReviews.length > 0 ? authoritativeReviews : viewerReviews;
+  const latest = baselineReviews
     .map((r) => Date.parse(r.submittedAt))
+    .filter((timestamp) => Number.isFinite(timestamp))
     .reduce((a, b) => Math.max(a, b), 0);
   if (!latest) return false;
   // Did the author push commits after the viewer's review?
@@ -328,6 +340,13 @@ function authorActedSinceViewerReview(
       return true;
     }
   }
+  for (const thread of pr.reviewThreads ?? []) {
+    for (const c of thread.comments) {
+      if (c.author && sameLogin(c.author, authorLogin) && Date.parse(c.createdAt) > latest) {
+        return true;
+      }
+    }
+  }
   return false;
 }
 
@@ -336,9 +355,12 @@ function authorActedSinceViewerReview(
 // style paths. We don't implement negation or character classes — neither
 // is needed for the triage use case.
 export function matchesGlob(path: string, pattern: string): boolean {
+  const directoryPattern = pattern.endsWith('/');
+  const hasSlash = pattern.includes('/');
+  const source = directoryPattern ? `${pattern}**` : pattern;
   const re = new RegExp(
-    '^' +
-      pattern
+    (hasSlash ? '^' : '^(?:.*/)?') +
+      source
         .split(/(\*\*|\*)/)
         .map((token) => {
           if (token === '**') return '.*';

@@ -526,6 +526,34 @@ test('author replies in an inline review thread count as revision activity', () 
   assert.equal(classify(pr, context).bucket, 'changes-requested-revised');
 });
 
+test('an author revision still counts when a later merge commit heads the branch', () => {
+  const pr = pullRequest({
+    commits: [
+      {
+        sha: 'author-revision',
+        messageHeadline: 'Address review feedback',
+        messageBody: 'Signed-off-by: Contributor <contributor@example.com>',
+        authorEmail: 'contributor@example.com',
+        authorLogin: 'contributor',
+        committedDate: hoursAgo(3),
+        parents: 1,
+      },
+      {
+        sha: 'merge-update',
+        messageHeadline: 'Merge latest base',
+        messageBody: '',
+        authorEmail: 'maintainer@example.com',
+        authorLogin: null,
+        committedDate: hoursAgo(2),
+        parents: 2,
+      },
+    ],
+    reviews: [{ author: 'maintainer-a', state: 'CHANGES_REQUESTED', submittedAt: hoursAgo(4) }],
+  });
+
+  assert.equal(classify(pr, context).bucket, 'changes-requested-revised');
+});
+
 test('a later reviewer comment moves the revision baseline', () => {
   const pr = pullRequest({
     commits: [
@@ -546,6 +574,39 @@ test('a later reviewer comment moves the revision baseline', () => {
   });
 
   assert.equal(classify(pr, context).bucket, 'hidden');
+});
+
+test('resolved-without-reply count excludes unlisted bot comments', () => {
+  const pr = pullRequest({
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        comments: [
+          {
+            author: 'unlisted-bot',
+            authorTypename: 'Bot',
+            authorAssociation: 'NONE',
+            createdAt: hoursAgo(5),
+          },
+        ],
+      },
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        comments: [
+          {
+            author: 'reviewer',
+            authorTypename: 'User',
+            authorAssociation: 'CONTRIBUTOR',
+            createdAt: hoursAgo(4),
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.ok(classify(pr, context).flags.includes('RESOLVED-W/O-REPLY: 1'));
 });
 
 test('CODEOWNERS directory and basename patterns match repository paths', () => {

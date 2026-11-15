@@ -11,6 +11,8 @@ import type { PullRequest } from './types.js';
 import { classifyActor, isEarlier, isLater, parseDateSafe } from './actor.js';
 import { getActorIdentityKind, isBotLogin, isDependencyBotAuthor, sameLogin } from './logins.js';
 import { ciFailing } from './predicates/ci_failing.js';
+import { resolvedWithoutReply } from './predicates/resolved_without_reply.js';
+import { unresolvedFromReviewer } from './predicates/unresolved_from_reviewer.js';
 
 const now = new Date('2026-10-30T12:00:00.000Z');
 
@@ -1751,6 +1753,48 @@ test('Rule 8: Truncated labels do not block an approved PR with successful CI', 
   const res = classifyActor(pr);
   assert.equal(res.nextActor, 'maintainer');
   assert.equal(res.reason, 'ready_to_merge');
+});
+
+test('Bot review comments do not count as unresolved reviewer feedback', () => {
+  const pr = basePr({
+    reviewThreads: [
+      {
+        isResolved: false,
+        resolvedBy: null,
+        commentsTruncated: false,
+        comments: [
+          {
+            author: 'unlisted-bot',
+            authorTypename: 'Bot',
+            authorAssociation: 'NONE',
+            createdAt: hoursAgo(1),
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(unresolvedFromReviewer(pr).triggered, false);
+});
+
+test('Bot review comments do not count as unresolved feedback when a thread is resolved', () => {
+  const pr = basePr({
+    reviewThreads: [
+      {
+        isResolved: true,
+        resolvedBy: 'contributor',
+        commentsTruncated: false,
+        comments: [
+          {
+            author: 'unlisted-bot',
+            authorTypename: 'Bot',
+            authorAssociation: 'NONE',
+            createdAt: hoursAgo(1),
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(resolvedWithoutReply(pr).triggered, false);
 });
 
 test('Rule 8: Approved PR with label-only CI failure routes to maintainer needs_label', () => {

@@ -1,5 +1,5 @@
 import type { CheckResult, PullRequest } from '../types.js';
-import { isBotLogin, sameLogin } from '../logins.js';
+import { isBotActor, sameLogin } from '../logins.js';
 
 // Triggers when at least one review thread is unresolved and the reviewer
 // has the last word — the author hasn't replied there yet. Ball is in the
@@ -13,7 +13,7 @@ export function unresolvedFromReviewer(pr: PullRequest): CheckResult {
 
   const offenders = threads.filter((t) => {
     if (t.isResolved || t.comments.length === 0) return false;
-    const comments = t.comments.filter((c) => c.author && !isBotLogin(c.author));
+    const comments = t.comments.filter((c) => c.author && !isBotActor(c.authorTypename, c.author));
     if (comments.length === 0) return false;
     const latest = comments.reduce((a, b) =>
       Date.parse(b.createdAt) > Date.parse(a.createdAt) ? b : a,

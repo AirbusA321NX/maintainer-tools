@@ -8,7 +8,7 @@
 import { type CheckResult, type PullRequest, runAll } from '@jaegertracing/maintainer-tools-checks';
 
 import { type CopilotReview, copilotReview } from './copilot.js';
-import { hasLogin, isBotAuthor, isBotLogin, isDependencyBotAuthor, sameLogin } from './logins.js';
+import { hasLogin, isBotActor, isBotAuthor, isDependencyBotAuthor, sameLogin } from './logins.js';
 
 export type Bucket =
   | 'priority-authors'
@@ -341,14 +341,13 @@ function authorActedSinceViewerReview(
   // Did the author push commits after the viewer's review?
   const authorLogin = pr.author?.login;
   if (!authorLogin) return false;
-  const headCommit = pr.commits[pr.commits.length - 1];
-  const headCommittedAt = Date.parse(headCommit?.committedDate ?? '');
-  if (
-    headCommit &&
-    headCommit.authorLogin &&
-    sameLogin(headCommit.authorLogin, authorLogin) &&
-    headCommittedAt > latestActivity
-  ) {
+  const hasAuthorRevision = pr.commits.some(
+    (commit) =>
+      commit.authorLogin &&
+      sameLogin(commit.authorLogin, authorLogin) &&
+      Date.parse(commit.committedDate) > latestActivity,
+  );
+  if (hasAuthorRevision) {
     return true;
   }
   // Or commented since?
@@ -507,7 +506,8 @@ function countResolvedWithoutReply(pr: PullRequest): number {
   for (const t of pr.reviewThreads ?? []) {
     if (!t.isResolved || !sameLogin(t.resolvedBy, authorLogin)) continue;
     const reviewerComments = t.comments.filter(
-      (c) => c.author && !sameLogin(c.author, authorLogin) && !isBotLogin(c.author),
+      (c) =>
+        c.author && !sameLogin(c.author, authorLogin) && !isBotActor(c.authorTypename, c.author),
     );
     if (reviewerComments.length === 0) continue;
     const latest = Math.max(...reviewerComments.map((c) => Date.parse(c.createdAt)));

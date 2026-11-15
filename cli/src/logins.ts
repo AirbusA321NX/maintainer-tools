@@ -4,6 +4,7 @@
 export {
   DEPENDENCY_BOT_LOGINS,
   hasLogin,
+  isBotActor,
   isBotAuthor,
   isBotLogin,
   isDependencyBotAuthor,

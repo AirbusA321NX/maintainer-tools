@@ -136,6 +136,10 @@ export function getCandidateReviewerLogins(pr: PullRequest): Set<string> {
   if (pr.reviewThreads) {
     for (const thread of pr.reviewThreads) {
       for (const comment of thread.comments) {
+        const privilegedAssociation =
+          comment.authorAssociation === 'OWNER' ||
+          comment.authorAssociation === 'MEMBER' ||
+          comment.authorAssociation === 'COLLABORATOR';
         if (
           comment.author &&
           !sameLogin(comment.author, authorLogin) &&
@@ -187,26 +191,25 @@ export function getLastReviewOrMaintainerActivityState(
   if (pr.reviewThreads) {
     for (const thread of pr.reviewThreads) {
       for (const comment of thread.comments) {
+        const privilegedAssociation =
+          comment.authorAssociation === 'OWNER' ||
+          comment.authorAssociation === 'MEMBER' ||
+          comment.authorAssociation === 'COLLABORATOR';
         if (
           comment.author &&
           isHumanActor(comment.authorTypename, comment.author) &&
           !sameLogin(comment.author, authorLogin) &&
           (candidateLogins.has(comment.author.toLowerCase()) ||
             (maintainerConfig?.status === 'available' &&
-              hasLogin(maintainerConfig.logins, comment.author)))
+              hasLogin(maintainerConfig.logins, comment.author)) ||
+            (maintainerConfig?.status === 'unavailable' && privilegedAssociation))
         ) {
           const isReviewer = candidateLogins.has(comment.author.toLowerCase());
           if (parseDateSafe(comment.createdAt) === 0) {
             hasInvalidActivityTimestamp = true;
             continue;
           }
-          if (
-            maintainerConfig?.status === 'unavailable' &&
-            !isReviewer &&
-            (comment.authorAssociation === 'OWNER' ||
-              comment.authorAssociation === 'MEMBER' ||
-              comment.authorAssociation === 'COLLABORATOR')
-          ) {
+          if (maintainerConfig?.status === 'unavailable' && !isReviewer && privilegedAssociation) {
             hasMaintainerConfigUncertainty = true;
           }
           if (isLater(comment.createdAt, latest)) latest = comment.createdAt;
@@ -389,6 +392,9 @@ export function collectCompletenessWarnings(pr: PullRequest): string[] {
   }
   if (pr.headCheckRunsTruncated !== false || pr.headCheckRuns === undefined) {
     warnings.push('ci_runs_truncated');
+  }
+  if (!pr.headRefOid || pr.commits[pr.commits.length - 1]?.sha !== pr.headRefOid) {
+    warnings.push('head_commit_mismatch');
   }
   if (pr.labelsTruncated !== false) warnings.push('labels_truncated');
   if (pr.commentsTruncated === true) {

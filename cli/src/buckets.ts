@@ -324,20 +324,33 @@ function authorActedSinceViewerReview(
     .map((r) => Date.parse(r.submittedAt))
     .filter((timestamp) => Number.isFinite(timestamp))
     .reduce((a, b) => Math.max(a, b), 0);
-  if (!latest) return false;
+  let latestActivity = latest;
+  for (const comment of pr.comments) {
+    if (comment.author && sameLogin(comment.author, viewer)) {
+      latestActivity = Math.max(latestActivity, Date.parse(comment.createdAt));
+    }
+  }
+  for (const thread of pr.reviewThreads ?? []) {
+    for (const comment of thread.comments) {
+      if (comment.author && sameLogin(comment.author, viewer)) {
+        latestActivity = Math.max(latestActivity, Date.parse(comment.createdAt));
+      }
+    }
+  }
+  if (!Number.isFinite(latestActivity) || latestActivity <= 0) return false;
   // Did the author push commits after the viewer's review?
   const authorLogin = pr.author?.login;
   if (!authorLogin) return false;
   const headCommittedAt = Date.parse(
     pr.commits[pr.commits.length - 1]?.committedDate ?? pr.updatedAt,
   );
-  if (headCommittedAt > latest) return true;
+  if (headCommittedAt > latestActivity) return true;
   // Or commented since?
   for (const c of pr.comments) {
     if (
       c.author &&
       sameLogin(c.author, authorLogin) &&
-      Date.parse(c.createdAt) > latest &&
+      Date.parse(c.createdAt) > latestActivity &&
       !sameLogin(c.author, viewer)
     ) {
       return true;
@@ -345,7 +358,11 @@ function authorActedSinceViewerReview(
   }
   for (const thread of pr.reviewThreads ?? []) {
     for (const c of thread.comments) {
-      if (c.author && sameLogin(c.author, authorLogin) && Date.parse(c.createdAt) > latest) {
+      if (
+        c.author &&
+        sameLogin(c.author, authorLogin) &&
+        Date.parse(c.createdAt) > latestActivity
+      ) {
         return true;
       }
     }
@@ -363,9 +380,11 @@ export function matchesGlob(path: string, pattern: string): boolean {
   const directoryPattern = withoutRoot.endsWith('/');
   const core = directoryPattern ? withoutRoot.slice(0, -1) : withoutRoot;
   const hasSlash = core.includes('/');
-  const source = directoryPattern ? `${core}/**` : core;
+  const doubleStarDirectory = core.startsWith('**/');
+  const source = directoryPattern ? `${core}/**` : doubleStarDirectory ? core.slice(3) : core;
+  const prefix = doubleStarDirectory ? '^(?:.*/)?' : rooted || hasSlash ? '^' : '^(?:.*/)?';
   const re = new RegExp(
-    (rooted || hasSlash ? '^' : '^(?:.*/)?') +
+    prefix +
       source
         .split(/(\*\*|\*)/)
         .map((token) => {
@@ -442,7 +461,7 @@ function issueFlags(pr: PullRequest, ctx: ClassifyContext): RowFlag[] {
   if (author && !isPriorityAuthor(ctx, author)) {
     for (const ref of refs) {
       const m = meta[`${ref.owner}/${ref.repo}#${ref.number}`];
-      if (m && !m.isPullRequest && m.author === author) {
+      if (m && !m.isPullRequest && sameLogin(m.author, author)) {
         flags.push('SELF-FILED');
         break;
       }
